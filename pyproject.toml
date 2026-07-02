@@ -1,0 +1,17 @@
+[project]
+name = "clab-mcp-server"
+version = "0.1.0"
+description = "Containerlab x Nornir/Netmiko ハイブリッド型 MCP サーバー"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "nornir>=3.4.0",
+    "nornir-netmiko>=1.0.0",
+    "netmiko>=4.3.0",
+    "ntc-templates>=4.0.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27.0",
+]
+
+[tool.uv]
+package = false
