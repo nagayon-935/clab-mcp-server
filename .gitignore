@@ -209,6 +209,21 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.idea/
+.vscode/
+
+# docker
+.dockerignore
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
