@@ -171,6 +171,42 @@ startup-configs/
   r1.conf   # トポロジに startup-config 未定義のノードの既定保存先
 ```
 
+## 開発
+
+CIと同じ方法でローカルにテストを実行できる。
+
+```bash
+uv sync --all-groups   # dev 依存グループから pytest をインストール
+uv run pytest -v
+```
+
+テストは `tests/` にあり、`server.py` の純粋ロジック部分（コマンド
+エイリアス解決、kind→platform マッピング、インベントリ構築、トポロジ
+YAML ヘルパー、テストエンジンのアサーション判定）を、稼働中の
+Containerlab 環境無しでカバーしている。
+
+## CI/CD
+
+GitHub Actions ワークフロー: [.github/workflows/ci.yml](.github/workflows/ci.yml)
+
+- **`test` ジョブ** — 全てのブランチへの push で実行される。
+  `uv sync --all-groups` で依存関係をインストールし、
+  `uv run pytest -v` を実行する。
+- **`publish-container` ジョブ** — `main` への push（マージ含む）時、
+  かつ `test` ジョブが成功した場合のみ実行される。`pyproject.toml` の
+  `version` フィールドを読み取り、[Dockerfile](Dockerfile) からイメージを
+  ビルドして、GitHub Container Registry へ
+  `ghcr.io/<owner>/<repo>:<version>` と `ghcr.io/<owner>/<repo>:latest`
+  の両タグでプッシュする。
+
+新しいバージョンのイメージを公開するには、`main` へマージする前に
+`pyproject.toml` の `version` を上げること。GHCR に push されるタグは
+常にその値と一致する。
+
+```bash
+docker pull ghcr.io/<owner>/<repo>:<version>
+```
+
 ## トラブルシューティング
 
 - **`clab` コマンドが見つからない**: `CLAB_HOST` を設定してリモート

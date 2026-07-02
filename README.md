@@ -175,6 +175,40 @@ startup-configs/
   r1.conf   # default location for nodes with no startup-config defined in the topology
 ```
 
+## Development
+
+Run the test suite locally the same way CI does:
+
+```bash
+uv sync --all-groups   # installs pytest from the dev dependency group
+uv run pytest -v
+```
+
+Tests live in `tests/` and cover the pure-logic parts of `server.py`
+(command alias resolution, kind→platform mapping, inventory building,
+topology YAML helpers, and the test-engine assertion logic) without
+requiring a live Containerlab environment.
+
+## CI/CD
+
+GitHub Actions workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml)
+
+- **`test` job** — runs on every push to any branch. Installs
+  dependencies with `uv sync --all-groups` and runs `uv run pytest -v`.
+- **`publish-container` job** — runs only on push to `main`, and only
+  if the `test` job succeeded. It reads the `version` field from
+  `pyproject.toml`, builds the image from the [Dockerfile](Dockerfile),
+  and pushes it to GitHub Container Registry as both
+  `ghcr.io/<owner>/<repo>:<version>` and `ghcr.io/<owner>/<repo>:latest`.
+
+To publish a new versioned image, bump `version` in `pyproject.toml`
+before merging to `main` — the tag pushed to GHCR always matches that
+value.
+
+```bash
+docker pull ghcr.io/<owner>/<repo>:<version>
+```
+
 ## Troubleshooting
 
 - **`clab` command not found**: Set `CLAB_HOST` to run on a remote host,
