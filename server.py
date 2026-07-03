@@ -37,17 +37,19 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
-import traceback
+import threading
 from datetime import datetime
 from typing import Any, Callable, Optional
 
 import yaml
+from netmiko.exceptions import NetmikoParsingException
 
 from mcp.server.fastmcp import FastMCP
 
@@ -166,6 +168,10 @@ NETMIKO_READ_TIMEOUT = int(os.environ.get("NETMIKO_READ_TIMEOUT", "60"))
 NETMIKO_SSH_CONFIG = os.environ.get("NETMIKO_SSH_CONFIG")
 
 DEFAULT_LINUX_DEVICE_TYPE = "linux"
+
+# MCP は stdout を JSON-RPC 専用に使うため、ログは必ず stderr へ出す。
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+logger = logging.getLogger("clab_hybrid")
 
 mcp = FastMCP("clab-hybrid")
 
@@ -293,6 +299,8 @@ def _inspect_via_api(lab_name: str) -> list[dict[str, Any]]:
     """clab-api-server 経由でノード情報を取得する（CLAB_API_URL 設定時のみ）。"""
     import httpx
 
+    assert CLAB_API_URL is not None  # 呼び出し元が CLAB_API_URL 設定時のみ呼ぶ
+
     url = f"{CLAB_API_URL.rstrip('/')}/api/v1/labs/{lab_name}"
     try:
         resp = httpx.get(url, timeout=60.0)
@@ -338,16 +346,45 @@ def _topo_nodes_and_links(topo: dict[str, Any]) -> tuple[dict[str, Any], list[An
     return nodes, links
 
 
+def _safe_join(base_dir: str, *parts: str) -> str:
+    """base_dir 配下に限定してパスを結合する。
+
+    トポロジ YAML の ``startup-config`` フィールドやノード名（YAML の dict
+    キーであり、外部入力に由来しうる）が ``../`` や絶対パスで base_dir を
+    脱出しようとする場合に備えた防御。脱出を検出すると ValueError を送出する。
+    """
+    base_abs = os.path.realpath(base_dir or ".")
+    target_abs = os.path.realpath(os.path.join(base_abs, *parts))
+    if target_abs != base_abs and not target_abs.startswith(base_abs + os.sep):
+        raise ValueError(
+            f"許可されたディレクトリ外へのパスです: {os.path.join(*parts)!r} (base={base_dir})"
+        )
+    return target_abs
+
+
+def _ensure_parent_dir(path: str) -> None:
+    """ファイルの親ディレクトリを作成する（存在しなければ）。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+
 def _startup_path_for_node(
-    topo: dict[str, Any], node_name: str, default_startup_dir: str
+    topo: dict[str, Any],
+    node_name: str,
+    default_startup_dir: str,
+    base_dir: str = ".",
 ) -> str:
-    """トポロジ定義から node の startup-config パスを解決（未定義なら既定パス）。"""
+    """トポロジ定義から node の startup-config パスを解決（未定義なら既定パス）。
+
+    ``base_dir`` 配下に限定して解決する。トポロジ YAML の内容やノード名が
+    base_dir を脱出しようとする場合は ValueError を送出する（呼び出し側で
+    ノード単位のエラーとして扱うこと）。
+    """
     nodes, _ = _topo_nodes_and_links(topo)
     node_def = nodes.get(node_name, {}) or {}
     startup = node_def.get("startup-config")
     if startup:
-        return startup
-    return os.path.join(default_startup_dir, f"{node_name}.conf")
+        return _safe_join(base_dir, startup)
+    return _safe_join(base_dir, default_startup_dir, f"{node_name}.conf")
 
 
 # =============================================================================
@@ -433,7 +470,14 @@ def _build_nornir(
 
     ``node_filter_regex`` があればノード短名で絞り込む。
     """
-    pattern = re.compile(node_filter_regex) if node_filter_regex else None
+    pattern = None
+    if node_filter_regex:
+        try:
+            pattern = re.compile(node_filter_regex)
+        except re.error as exc:
+            raise RuntimeError(
+                f"不正な node_filter_regex です: {node_filter_regex!r} ({exc})"
+            ) from exc
 
     hosts = Hosts()
     for node in nodes:
@@ -482,7 +526,10 @@ def _run_command_task(
             read_timeout=NETMIKO_READ_TIMEOUT,
         )
         output = sub.result
-    except Exception:  # noqa: BLE001 - TextFSM 未対応等は生テキストで再試行
+    except (NetmikoParsingException, ValueError):
+        # TextFSM テンプレート不一致等の「解析失敗」のみ生テキストで再試行する。
+        # 接続断・認証エラー等はここでは捕捉せず、そのまま呼び出し元へ伝播させる
+        # （非冪等コマンドを不必要に再実行しないため）。
         if use_textfsm:
             sub = task.run(
                 task=netmiko_send_command,
@@ -509,7 +556,7 @@ def _collect_config_task(task: Task) -> Result:
             result="",
             failed=False,
             changed=False,
-            severity_level=30,
+            severity_level=logging.WARNING,
         )
 
     lines = spec.split("\n")
@@ -518,8 +565,10 @@ def _collect_config_task(task: Task) -> Result:
         if prep == "enable":
             try:
                 conn.enable()
-            except Exception:  # noqa: BLE001 - enable 不要/失敗は続行
-                pass
+            except Exception as exc:  # noqa: BLE001 - enable 不要/失敗は続行
+                logger.debug(
+                    "enable() failed or not required for %s: %s", task.host.name, exc
+                )
         elif prep:
             conn.send_command(prep, read_timeout=NETMIKO_READ_TIMEOUT)
 
@@ -553,8 +602,8 @@ def _run_nornir(
     finally:
         try:
             nr.close_connections()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("close_connections failed: %s", exc)
 
 
 # =============================================================================
@@ -583,6 +632,9 @@ def _load_test_cases(test_file: str) -> tuple[Optional[str], list[dict[str, Any]
     return lab_name, cases
 
 
+_MAX_REGEX_INPUT_LEN = 100_000  # regex アサーション評価対象の上限文字数（ReDoS対策）
+
+
 def _evaluate_assertion(output: str, assertion: dict[str, Any]) -> tuple[bool, str]:
     """contains / regex / exit_code 判定を行う。"""
     if "contains" in assertion:
@@ -592,7 +644,9 @@ def _evaluate_assertion(output: str, assertion: dict[str, Any]) -> tuple[bool, s
 
     if "regex" in assertion:
         pat = str(assertion["regex"])
-        ok = re.search(pat, output) is not None
+        # ReDoS 対策: 破局的バックトラッキングの被害を限定するため評価対象を切り詰める。
+        target = output[:_MAX_REGEX_INPUT_LEN]
+        ok = re.search(pat, target) is not None
         return ok, f"regex {pat!r}: {'OK' if ok else 'NG'}"
 
     if "exit_code" in assertion:
@@ -697,7 +751,7 @@ def deploy_lab(topo_yaml_path: str) -> str:
 
 
 @mcp.tool()
-def inspect_lab_topology(lab_name: str) -> dict:
+def inspect_lab_topology(lab_name: str) -> dict[str, Any]:
     """稼働中ラボの全ノード（管理IP・kind）とリンク情報を取得して返す。
 
     ノード情報は ``clab inspect`` から、リンク情報はカレントディレクトリ配下で
@@ -768,7 +822,8 @@ def run_parallel_command(
             default=str,
         )
     except Exception as exc:  # noqa: BLE001
-        return f"[run_parallel_command] エラー: {exc}\n{traceback.format_exc()}"
+        logger.exception("run_parallel_command failed")
+        return f"[run_parallel_command] エラー: {exc}"
 
 
 @mcp.tool()
@@ -804,11 +859,13 @@ def snapshot_and_save_configs(
         return f"[snapshot_and_save_configs] エラー: {exc}"
 
     topo = None
+    base_dir = "."
     if mode == "startup":
         topo_path = _find_topo_for_lab(lab_name)
         if not topo_path:
             return "[snapshot_and_save_configs] エラー: startup モードにはトポロジ YAML が必要です"
         topo = _load_topo_yaml(topo_path)
+        base_dir = os.path.dirname(os.path.abspath(topo_path)) or "."
 
     saved: list[str] = []
     skipped: list[str] = []
@@ -829,13 +886,18 @@ def snapshot_and_save_configs(
             skipped.append(host_name)  # KIND_COMMAND 未定義 kind 等
             continue
 
-        if mode == "snapshot":
-            dest = os.path.join(target_dir, f"{host_name}.conf")
-        else:
-            dest = _startup_path_for_node(topo, host_name, default_startup_dir)
-            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        try:
+            if mode == "snapshot":
+                dest = _safe_join(target_dir, f"{host_name}.conf")
+            else:
+                assert topo is not None  # mode == "startup" のときのみこの分岐に入る
+                dest = _startup_path_for_node(topo, host_name, default_startup_dir, base_dir)
+        except ValueError as exc:
+            errors.append(f"{host_name}: {exc}")
+            continue
 
         try:
+            _ensure_parent_dir(dest)
             with open(dest, "w", encoding="utf-8") as fh:
                 fh.write(config_text + "\n")
             saved.append(dest)
@@ -874,20 +936,21 @@ def restore_startup_configs(
     except RuntimeError as exc:
         return f"[restore_startup_configs] エラー: {exc}"
 
-    # スナップショットディレクトリを解決
+    base_dir = os.path.dirname(os.path.abspath(topo_path)) or "."
+
+    # スナップショットディレクトリを解決（save_dir 配下に限定する）
     if snapshot_name == "latest":
         candidates = sorted(glob.glob(os.path.join(save_dir, "save-*")))
         if not candidates:
             return f"[restore_startup_configs] エラー: スナップショットが見つかりません ({save_dir})"
         snapshot_dir = candidates[-1]
     else:
-        snapshot_dir = os.path.join(save_dir, snapshot_name)
+        try:
+            snapshot_dir = _safe_join(save_dir, snapshot_name)
+        except ValueError as exc:
+            return f"[restore_startup_configs] エラー: {exc}"
         if not os.path.isdir(snapshot_dir):
-            # 完全パス指定にも対応
-            if os.path.isdir(snapshot_name):
-                snapshot_dir = snapshot_name
-            else:
-                return f"[restore_startup_configs] エラー: スナップショットが存在しません: {snapshot_dir}"
+            return f"[restore_startup_configs] エラー: スナップショットが存在しません: {snapshot_dir}"
 
     nodes, _ = _topo_nodes_and_links(topo)
     restored: list[str] = []
@@ -895,13 +958,17 @@ def restore_startup_configs(
     errors: list[str] = []
 
     for node_name in nodes:
-        src = os.path.join(snapshot_dir, f"{node_name}.conf")
+        try:
+            src = _safe_join(snapshot_dir, f"{node_name}.conf")
+            dest = _startup_path_for_node(topo, node_name, "startup-configs", base_dir)
+        except ValueError as exc:
+            errors.append(f"{node_name}: {exc}")
+            continue
         if not os.path.isfile(src):
             missing.append(node_name)
             continue
-        dest = _startup_path_for_node(topo, node_name, "startup-configs")
         try:
-            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            _ensure_parent_dir(dest)
             shutil.copyfile(src, dest)
             restored.append(f"{node_name}: {src} -> {dest}")
         except OSError as exc:
@@ -963,7 +1030,19 @@ def run_topology_tests(test_file_or_dir: str) -> str:
             continue
 
         for case in cases:
-            outcomes = _run_test_case(lab_name, case)
+            try:
+                outcomes = _run_test_case(lab_name, case)
+            except Exception as exc:  # noqa: BLE001 - 1ケースの異常でバッチ全体を落とさない
+                case_name = case.get("name", "unnamed")
+                logger.exception("test case %r raised unexpectedly", case_name)
+                outcomes = [
+                    {
+                        "test": case_name,
+                        "node": "-",
+                        "passed": False,
+                        "detail": f"想定外エラー: {exc}",
+                    }
+                ]
             all_outcomes.extend(outcomes)
             for o in outcomes:
                 status = "PASS" if o["passed"] else "FAIL"
@@ -1042,6 +1121,12 @@ def trigger_packet_capture(
         )
         if ssh_proc.stdout:
             ssh_proc.stdout.close()  # SIGPIPE を Wireshark 側へ伝播させる
+        # fire-and-forget な子プロセスなのでここではブロックせず、終了を
+        # バックグラウンドスレッドで待ち受けてゾンビ化を防ぐ。
+        threading.Thread(
+            target=lambda: (ssh_proc.wait(), ws_proc.wait()),
+            daemon=True,
+        ).start()
     except FileNotFoundError as exc:
         return f"[trigger_packet_capture] エラー: 実行バイナリが見つかりません: {exc}"
     except Exception as exc:  # noqa: BLE001

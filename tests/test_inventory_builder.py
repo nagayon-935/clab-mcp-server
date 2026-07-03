@@ -38,6 +38,12 @@ def test_build_nornir_raises_when_no_hosts_match():
         server._build_nornir(NODES, node_filter_regex="^nomatch$")
 
 
+def test_build_nornir_converts_bad_regex_to_runtime_error():
+    # re.error must not leak past _build_nornir: callers only catch RuntimeError.
+    with pytest.raises(RuntimeError):
+        server._build_nornir(NODES, node_filter_regex="(unclosed[")
+
+
 def test_build_nornir_worker_count_capped_by_host_count():
     nr = server._build_nornir(NODES, node_filter_regex="^r")
     assert nr.runner.num_workers == 2
