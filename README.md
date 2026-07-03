@@ -124,7 +124,8 @@ default credentials.
 
 | Tool | Summary |
 |---|---|
-| `deploy_lab(topo_yaml_path)` | Deploy a new lab from a topology YAML file |
+| `deploy_lab(topo_yaml_path, reconfigure=False)` | Deploy a new lab from a topology YAML file (`reconfigure=True` adds `--reconfigure`, regenerating config artifacts) |
+| `destroy_lab(topo_yaml_path, cleanup=False)` | Destroy a lab from a topology YAML file (`cleanup=True` adds `--cleanup`, deleting the lab directory entirely) |
 | `inspect_lab_topology(lab_name)` | Get running nodes' mgmt IP, kind, and link info |
 | `run_parallel_command(lab_name, command_or_alias, node_filter_regex=None)` | Run a command on all (or regex-filtered) nodes fully in parallel |
 | `snapshot_and_save_configs(lab_name, mode="snapshot", save_dir="save", default_startup_dir="startup-configs")` | Collect configs from all nodes in parallel; save as a snapshot or write directly to startup-config |

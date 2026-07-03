@@ -50,6 +50,7 @@ from typing import Any, Callable, Optional
 
 import yaml
 from netmiko.exceptions import NetmikoParsingException
+from textfsm.parser import TextFSMError
 
 from mcp.server.fastmcp import FastMCP
 
@@ -64,6 +65,7 @@ from nornir.core.inventory import (
     Hosts,
     Inventory,
 )
+from nornir.core.exceptions import NornirSubTaskError
 from nornir.core.plugins.connections import ConnectionPluginRegister
 from nornir.core.task import Result, Task
 from nornir.plugins.runners import ThreadedRunner
@@ -123,6 +125,7 @@ KIND_COMMAND: dict[str, str] = {
     "juniper_vjunosrouter": "show configuration | no-more",
     "juniper_vjunosswitch": "show configuration | no-more",
     "juniper_cjunosevolved": "show configuration | no-more",
+    "nokia_srlinux": "info from running",
 }
 
 # kind ごとの既定認証情報 (username, password)
@@ -140,6 +143,7 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     "juniper_vjunosrouter": ("admin", "admin@123"),
     "juniper_vjunosswitch": ("admin", "admin@123"),
     "juniper_cjunosevolved": ("admin", "admin@123"),
+    "nokia_srlinux": ("admin", "NokiaSrl1!"),
 }
 
 # clab kind -> Netmiko/Nornir platform (device_type)
@@ -526,11 +530,17 @@ def _run_command_task(
             read_timeout=NETMIKO_READ_TIMEOUT,
         )
         output = sub.result
-    except (NetmikoParsingException, ValueError):
+    except NornirSubTaskError as exc:
+        # task.run()（ネストされたサブタスク呼び出し）は原因の型を問わず常に
+        # NornirSubTaskError でラップして再送出するため、実際の原因は
+        # exc.result[0].exception を見て判別する必要がある。
         # TextFSM テンプレート不一致等の「解析失敗」のみ生テキストで再試行する。
         # 接続断・認証エラー等はここでは捕捉せず、そのまま呼び出し元へ伝播させる
         # （非冪等コマンドを不必要に再実行しないため）。
-        if use_textfsm:
+        cause = exc.result[0].exception
+        if use_textfsm and isinstance(
+            cause, (NetmikoParsingException, ValueError, TextFSMError)
+        ):
             sub = task.run(
                 task=netmiko_send_command,
                 command_string=command,
@@ -576,13 +586,25 @@ def _collect_config_task(task: Task) -> Result:
     return Result(host=task.host, result=config_text)
 
 
+def _unwrap_exception(exc: BaseException) -> BaseException:
+    """NornirSubTaskError のラップを剥がし、実際の原因例外を取り出す。
+
+    ``task.run()``（ネストされたサブタスク呼び出し）は原因の型を問わず常に
+    NornirSubTaskError で包んで再送出するため、ユーザー向けのエラー表示では
+    ラップを剥がした実際の例外を見せないと診断できない。
+    """
+    while isinstance(exc, NornirSubTaskError) and exc.result and exc.result[0].exception:
+        exc = exc.result[0].exception
+    return exc
+
+
 def _format_results(agg: Any) -> dict[str, dict[str, Any]]:
     """AggregatedResult を LLM 向けの正規化 dict に整形する。"""
     formatted: dict[str, dict[str, Any]] = {}
     for host_name, multi in agg.items():
         top = multi[0]
         if top.failed:
-            exc = top.exception
+            exc = _unwrap_exception(top.exception) if top.exception else None
             formatted[host_name] = {
                 "failed": True,
                 "error": f"{type(exc).__name__}: {exc}" if exc else "unknown error",
@@ -718,7 +740,7 @@ def _run_test_case(
 # =============================================================================
 
 @mcp.tool()
-def deploy_lab(topo_yaml_path: str) -> str:
+def deploy_lab(topo_yaml_path: str, reconfigure: bool = False) -> str:
     """Containerlab トポロジ YAML から新規ラボをデプロイする。
 
     ``CLAB_HOST`` が設定されていれば ssh 経由でリモートホスト上に、未設定なら
@@ -727,6 +749,8 @@ def deploy_lab(topo_yaml_path: str) -> str:
 
     Args:
         topo_yaml_path: デプロイする *.clab.yml トポロジファイルのパス。
+        reconfigure: True の場合 ``clab deploy --reconfigure`` を付与し、
+            既存の設定成果物を再生成して上書きする（``CLAB_API_URL`` 使用時は無視）。
 
     Returns:
         clab の実行結果（標準出力）またはエラーサマリ文字列。
@@ -744,10 +768,54 @@ def deploy_lab(topo_yaml_path: str) -> str:
         if not CLAB_HOST and not os.path.isfile(topo_yaml_path):
             return f"[deploy_lab] エラー: トポロジファイルが見つかりません: {topo_yaml_path}"
 
-        proc = _run_clab(["deploy", "-t", topo_yaml_path], timeout=600)
+        args = ["deploy", "-t", topo_yaml_path]
+        if reconfigure:
+            args.append("--reconfigure")
+        proc = _run_clab(args, timeout=600)
         return f"[deploy_lab] デプロイ成功:\n{proc.stdout.strip()}"
     except Exception as exc:  # noqa: BLE001
         return f"[deploy_lab] エラー: {exc}"
+
+
+@mcp.tool()
+def destroy_lab(topo_yaml_path: str, cleanup: bool = False) -> str:
+    """Containerlab トポロジ YAML からラボを破棄する。
+
+    ``CLAB_HOST`` が設定されていれば ssh 経由でリモートホスト上に、未設定なら
+    ローカルで ``clab destroy`` を実行する。``CLAB_API_URL`` 設定時は
+    clab-api-server(httpx) 経由で破棄する。
+
+    Args:
+        topo_yaml_path: 破棄する *.clab.yml トポロジファイルのパス。
+        cleanup: True の場合 ``clab destroy --cleanup`` を付与し、ラボディレクトリ
+            (生成された設定・証明書等)ごと完全に削除する（``CLAB_API_URL`` 使用時は無視）。
+
+    Returns:
+        clab の実行結果（標準出力）またはエラーサマリ文字列。
+    """
+    try:
+        if CLAB_API_URL:
+            import httpx
+
+            topo = _load_topo_yaml(topo_yaml_path)
+            lab_name = topo.get("name")
+            if not lab_name:
+                return "[destroy_lab] エラー: トポロジ YAML に name フィールドがありません"
+            url = f"{CLAB_API_URL.rstrip('/')}/api/v1/labs/{lab_name}"
+            resp = httpx.delete(url, timeout=600.0)
+            resp.raise_for_status()
+            return f"[destroy_lab] API 破棄成功:\n{resp.text}"
+
+        if not CLAB_HOST and not os.path.isfile(topo_yaml_path):
+            return f"[destroy_lab] エラー: トポロジファイルが見つかりません: {topo_yaml_path}"
+
+        args = ["destroy", "-t", topo_yaml_path]
+        if cleanup:
+            args.append("--cleanup")
+        proc = _run_clab(args, timeout=600)
+        return f"[destroy_lab] 破棄成功:\n{proc.stdout.strip()}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[destroy_lab] エラー: {exc}"
 
 
 @mcp.tool()
