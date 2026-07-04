@@ -128,6 +128,10 @@ KIND_COMMAND: dict[str, str] = {
     "nokia_srlinux": "info from running",
 }
 
+# kind=="linux"（FRR 系イメージ）の設定取得コマンド。docker exec 経由で実行するため
+# KIND_COMMAND とは別に持つ（Netmiko の enable/prep ステップは不要）。
+LINUX_CONFIG_COMMAND = "vtysh -c 'show running-config'"
+
 # kind ごとの既定認証情報 (username, password)
 KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     "cisco_xrd": ("clab", "clab@123"),
@@ -184,38 +188,42 @@ mcp = FastMCP("clab-hybrid")
 # === Clab Introspection (subprocess / optional httpx) =========================
 # =============================================================================
 
+def _remote_argv(local: list[str]) -> list[str]:
+    """ローカル argv を、``CLAB_HOST`` 設定時は ssh 経由のリモート argv にラップする。
+
+    ``clab`` サブプロセスに限らず、docker exec など「containerlab ホスト上で
+    実行すべきコマンド」全般で共有する変換ロジック。
+    """
+    if not CLAB_HOST:
+        return local
+    target = f"{CLAB_SSH_USER}@{CLAB_HOST}" if CLAB_SSH_USER else CLAB_HOST
+    remote_cmd = " ".join(shlex.quote(part) for part in local)
+    return ["ssh", target, remote_cmd]
+
+
 def _clab_argv(args: list[str]) -> list[str]:
     """clab 呼び出しの argv を組み立てる（ローカル or ssh リモート）。"""
     local = []
     if CLAB_SUDO:
         local.append("sudo")
     local += [CLAB_BIN, *args]
+    return _remote_argv(local)
 
-    if not CLAB_HOST:
-        return local
 
-    target = f"{CLAB_SSH_USER}@{CLAB_HOST}" if CLAB_SSH_USER else CLAB_HOST
-    remote_cmd = " ".join(shlex.quote(part) for part in local)
-    return ["ssh", target, remote_cmd]
+def _run_argv(argv: list[str], timeout: int, label: str) -> subprocess.CompletedProcess:
+    """任意の argv を実行し CompletedProcess を返す（バイナリ不在/タイムアウトは RuntimeError）。"""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError as exc:  # 対象バイナリ（clab / docker / ssh）が無い
+        raise RuntimeError(f"実行バイナリが見つかりません: {argv[0]!r} ({exc})") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{label} がタイムアウトしました") from exc
 
 
 def _run_clab(args: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
     """clab コマンドを実行し CompletedProcess を返す。失敗時は RuntimeError。"""
     argv = _clab_argv(args)
-    try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:  # clab / ssh バイナリが無い
-        raise RuntimeError(
-            f"実行バイナリが見つかりません: {argv[0]!r} ({exc})"
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"clab コマンドがタイムアウトしました: {' '.join(args)}") from exc
-
+    proc = _run_argv(argv, timeout, f"clab コマンド: {' '.join(args)}")
     if proc.returncode != 0:
         raise RuntimeError(
             f"clab コマンド失敗 (rc={proc.returncode}): {' '.join(args)}\n"
@@ -516,12 +524,48 @@ def resolve_command(command_or_alias: str, kind: str) -> str:
     return aliases.get(kind, command_or_alias)  # kind 未定義ならリテラルにフォールバック
 
 
-def _run_command_task(
-    task: Task, command_or_alias: str, use_textfsm: bool
-) -> Result:
-    """各ホストでエイリアス解決したコマンドを Netmiko 実行する Nornir タスク。"""
-    kind = task.host.data.get("kind", "linux")
-    command = resolve_command(command_or_alias, kind)
+def _docker_exec_argv(container: str, command: str) -> list[str]:
+    """linux kind ノードへの docker exec 呼び出し argv を組み立てる。"""
+    local = []
+    if CLAB_SUDO:
+        local.append("sudo")
+    local += ["docker", "exec", container, "sh", "-c", command]
+    return _remote_argv(local)
+
+
+def _run_docker_exec(container: str, command: str, timeout: int) -> str:
+    """linux kind ノードへ docker exec でコマンドを送り、標準出力を返す。
+
+    containerlab の linux/FRR 系イメージは通常 sshd を持たないため、Netmiko(SSH)
+    ではなく docker exec でコンテナへ直接コマンドを送り込む（scripts/clab-exec-all,
+    scripts/clab-cli と同じ方式）。``CLAB_HOST`` 設定時は ssh 経由でリモートの
+    containerlab ホスト上で docker exec を実行する。
+    """
+    argv = _docker_exec_argv(container, command)
+    proc = _run_argv(argv, timeout, f"docker exec ({container})")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"docker exec 失敗 (rc={proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    return proc.stdout
+
+
+def _dispatch_command(
+    task: Task, kind: str, command: str, use_textfsm: bool
+) -> Any:
+    """kind に応じてコマンドを実行し、生の結果（構造化データ or 文字列）を返す。
+
+    kind=="linux"（containerlab の FRR/linux 系イメージ）は sshd を持たないのが
+    通例のため docker exec 経由で実行し、それ以外（ネットワーク OS kind）は
+    Netmiko(SSH) 経由で実行する。``run_parallel_command``/``run_node_command``
+    (``_run_command_task``) と ``run_topology_tests``（``_test_task``）の両方が
+    この関数を共有することで、docker exec 分岐の適用漏れを防ぐ。
+    """
+    if kind == "linux":
+        container = task.host.data.get("container") or task.host.name
+        return _run_docker_exec(container, command, NETMIKO_READ_TIMEOUT)
+
     try:
         sub = task.run(
             task=netmiko_send_command,
@@ -529,7 +573,7 @@ def _run_command_task(
             use_textfsm=use_textfsm,
             read_timeout=NETMIKO_READ_TIMEOUT,
         )
-        output = sub.result
+        return sub.result
     except NornirSubTaskError as exc:
         # task.run()（ネストされたサブタスク呼び出し）は原因の型を問わず常に
         # NornirSubTaskError でラップして再送出するため、実際の原因は
@@ -547,20 +591,51 @@ def _run_command_task(
                 use_textfsm=False,
                 read_timeout=NETMIKO_READ_TIMEOUT,
             )
-            output = sub.result
-        else:
-            raise
+            return sub.result
+        raise
+
+
+def _run_command_task(
+    task: Task, command_or_alias: str, use_textfsm: bool
+) -> Result:
+    """各ホストでエイリアス解決したコマンドを実行する Nornir タスク。"""
+    kind = task.host.data.get("kind", "linux")
+    command = resolve_command(command_or_alias, kind)
+    output = _dispatch_command(task, kind, command, use_textfsm)
     return Result(host=task.host, result={"command": command, "output": output})
 
 
 def _collect_config_task(task: Task) -> Result:
-    """KIND_COMMAND を用いてノードの設定全文を取得する Nornir タスク。"""
-    kind = task.host.data.get("kind", "linux")
-    spec = KIND_COMMAND.get(kind)
-    conn = task.host.get_connection("netmiko", task.nornir.config)
+    """ノードの設定全文を取得する Nornir タスク。
 
+    kind=="linux"（FRR 系イメージ）は sshd を持たないため docker exec 経由で
+    vtysh を叩いて取得する。vtysh を持たないプレーンな linux コンテナ（L2
+    スイッチ役等）ではコマンドが失敗するため、その場合は KIND_COMMAND 未定義
+    kind と同様に取得対象外としてスキップする。それ以外の kind は
+    KIND_COMMAND（未定義なら取得対象外）を用いて Netmiko 経由で取得する。
+    """
+    kind = task.host.data.get("kind", "linux")
+
+    if kind == "linux":
+        container = task.host.data.get("container") or task.host.name
+        try:
+            config_text = _run_docker_exec(
+                container, LINUX_CONFIG_COMMAND, NETMIKO_READ_TIMEOUT
+            )
+        except RuntimeError:
+            # vtysh が無い（FRR 以外の）linux コンテナは取得対象外扱いにする
+            return Result(
+                host=task.host,
+                result="",
+                failed=False,
+                changed=False,
+                severity_level=logging.WARNING,
+            )
+        return Result(host=task.host, result=config_text)
+
+    spec = KIND_COMMAND.get(kind)
     if not spec:
-        # KIND_COMMAND 未定義 kind（linux 等）は取得対象外
+        # KIND_COMMAND 未定義 kind は取得対象外
         return Result(
             host=task.host,
             result="",
@@ -569,6 +644,7 @@ def _collect_config_task(task: Task) -> Result:
             severity_level=logging.WARNING,
         )
 
+    conn = task.host.get_connection("netmiko", task.nornir.config)
     lines = spec.split("\n")
     for prep in lines[:-1]:
         prep = prep.strip()
@@ -706,13 +782,8 @@ def _run_test_case(
         command = resolve_command(command_or_alias, kind)
         if wants_exit_code and kind == "linux":
             command = f"{command}; echo __RC__=$?"
-        sub = task.run(
-            task=netmiko_send_command,
-            command_string=command,
-            use_textfsm=False,
-            read_timeout=NETMIKO_READ_TIMEOUT,
-        )
-        return Result(host=task.host, result=sub.result)
+        output = _dispatch_command(task, kind, command, use_textfsm=False)
+        return Result(host=task.host, result=output)
 
     try:
         nr = _build_nornir(nodes, node_filter_regex=node_filter)
@@ -778,6 +849,39 @@ def deploy_lab(topo_yaml_path: str, reconfigure: bool = False) -> str:
 
 
 @mcp.tool()
+def apply_lab(topo_yaml_path: str, dry_run: bool = False) -> str:
+    """トポロジ YAML と稼働中ラボの差分だけを反映する（containerlab 0.77+ の ``apply``）。
+
+    ラボが存在しなければ新規デプロイし、既に稼働中ならノード/リンクの追加・削除など
+    サポートされる変更のみを検出して反映する（全体再作成の ``deploy --reconfigure``
+    や ``redeploy`` と異なり、変更の無いノードは再起動・再作成されない）。
+    ``CLAB_HOST`` が設定されていれば ssh 経由でリモートホスト上で実行する。
+    containerlab 0.77 未満には ``apply`` サブコマンド自体が存在しない点に注意。
+    ``deploy_lab``/``destroy_lab`` と異なり ``CLAB_API_URL``（clab-api-server
+    経由実行）には対応していない。設定されていても常に subprocess/ssh 経由で
+    ``clab`` を実行する。
+
+    Args:
+        topo_yaml_path: 適用する *.clab.yml トポロジファイルのパス。
+        dry_run: True の場合 ``--dry-run`` を付与し、実際には適用せず変更内容のみ表示する。
+
+    Returns:
+        clab の実行結果（標準出力）またはエラーサマリ文字列。
+    """
+    try:
+        if not CLAB_HOST and not os.path.isfile(topo_yaml_path):
+            return f"[apply_lab] エラー: トポロジファイルが見つかりません: {topo_yaml_path}"
+
+        args = ["apply", "-t", topo_yaml_path]
+        if dry_run:
+            args.append("--dry-run")
+        proc = _run_clab(args, timeout=600)
+        return f"[apply_lab] 適用成功:\n{proc.stdout.strip()}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[apply_lab] エラー: {exc}"
+
+
+@mcp.tool()
 def destroy_lab(topo_yaml_path: str, cleanup: bool = False) -> str:
     """Containerlab トポロジ YAML からラボを破棄する。
 
@@ -816,6 +920,62 @@ def destroy_lab(topo_yaml_path: str, cleanup: bool = False) -> str:
         return f"[destroy_lab] 破棄成功:\n{proc.stdout.strip()}"
     except Exception as exc:  # noqa: BLE001
         return f"[destroy_lab] エラー: {exc}"
+
+
+@mcp.tool()
+def redeploy_lab(topo_yaml_path: str, cleanup: bool = False) -> str:
+    """ラボを破棄してから同じトポロジ YAML で再デプロイする（``clab redeploy``）。
+
+    ``destroy_lab`` に続けて ``deploy_lab`` を呼ぶのと違い、containerlab 自身の
+    ``redeploy`` サブコマンドを1回の呼び出しで実行する。``CLAB_HOST`` が設定されて
+    いれば ssh 経由でリモートホスト上で実行する。``deploy_lab``/``destroy_lab``
+    と異なり ``CLAB_API_URL``（clab-api-server 経由実行）には対応していない。
+    設定されていても常に subprocess/ssh 経由で ``clab`` を実行する。
+
+    Args:
+        topo_yaml_path: 対象の *.clab.yml トポロジファイルのパス。
+        cleanup: True の場合 ``--cleanup`` を付与し、破棄時にラボディレクトリ
+            (生成された設定・証明書等)ごと削除してから再デプロイする。
+
+    Returns:
+        clab の実行結果（標準出力）またはエラーサマリ文字列。
+    """
+    try:
+        if not CLAB_HOST and not os.path.isfile(topo_yaml_path):
+            return f"[redeploy_lab] エラー: トポロジファイルが見つかりません: {topo_yaml_path}"
+
+        args = ["redeploy", "-t", topo_yaml_path]
+        if cleanup:
+            args.append("--cleanup")
+        proc = _run_clab(args, timeout=600)
+        return f"[redeploy_lab] 再デプロイ成功:\n{proc.stdout.strip()}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[redeploy_lab] エラー: {exc}"
+
+
+@mcp.tool()
+def restart_lab_nodes(lab_name: str, node_names: Optional[list[str]] = None) -> str:
+    """稼働中ラボのノードを再起動する（``clab restart``、seamless dataplane）。
+
+    ``node_names`` を省略するとラボ内の全ノードを再起動する。破棄・再作成は
+    行わないため、他ノードのデータプレーンには影響しない（containerlab 側の
+    「seamless dataplane」restart）。
+
+    Args:
+        lab_name: 対象ラボ名（clab トポロジの name フィールド）。
+        node_names: 再起動するノード短名のリスト（省略時は全ノード）。
+
+    Returns:
+        clab の実行結果（標準出力）またはエラーサマリ文字列。
+    """
+    try:
+        args = ["restart", "--name", lab_name]
+        if node_names:
+            args += ["-n", ",".join(node_names)]
+        proc = _run_clab(args, timeout=300)
+        return f"[restart_lab_nodes] 再起動成功:\n{proc.stdout.strip()}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[restart_lab_nodes] エラー: {exc}"
 
 
 @mcp.tool()
@@ -895,6 +1055,71 @@ def run_parallel_command(
 
 
 @mcp.tool()
+def run_node_command(
+    lab_name: str, node_name: str, command: Optional[str] = None
+) -> str:
+    """1ノードにのみ絞ってコマンドを実行する（scripts/clab-cli 相当の非対話版）。
+
+    run_parallel_command と同じ kind 別振り分け（linux/FRR は docker exec、それ以外
+    のネットワーク OS kind は Netmiko/SSH）を1ノードだけに適用する。疎通確認や
+    認証情報の切り分けなど、全ノード一斉実行では埋もれがちな個別デバッグに使う。
+
+    Args:
+        lab_name: 対象ラボ名。
+        node_name: 対象ノードの短名（inspect_lab_topology が返す name と一致）。
+        command: エイリアス名または実行コマンド文字列（省略時は 'interfaces' で疎通確認のみ）。
+
+    Returns:
+        kind・接続方式・宛先と実行結果（成功時は出力、失敗時はエラー詳細）を含む文字列。
+    """
+    try:
+        nodes = _inspect_nodes(lab_name)
+    except Exception as exc:  # noqa: BLE001
+        return f"[run_node_command] エラー: {exc}"
+
+    node = next((n for n in nodes if n["name"] == node_name), None)
+    if node is None:
+        available = ", ".join(n["name"] for n in nodes) or "(なし)"
+        return (
+            f"[run_node_command] エラー: ノード '{node_name}' が見つかりません。"
+            f" 稼働中ノード: {available}"
+        )
+
+    kind = node.get("kind", "linux")
+    access = (
+        f"docker exec ({node.get('container')})"
+        if kind == "linux"
+        else f"ssh ({node.get('mgmt_ip')})"
+    )
+    command_or_alias = command or "interfaces"
+
+    try:
+        nr = _build_nornir([node])
+    except Exception as exc:  # noqa: BLE001
+        return f"[run_node_command] エラー: {exc}"
+
+    results = _run_nornir(
+        nr, _run_command_task, command_or_alias=command_or_alias, use_textfsm=True
+    )
+    res = results[node_name]
+
+    lines = [f"[run_node_command] node={node_name} kind={kind} 接続方式={access}"]
+    if res["failed"]:
+        lines.append("結果: 失敗")
+        lines.append(f"詳細: {res['error']}")
+    else:
+        result = res["result"]
+        output = result.get("output") if isinstance(result, dict) else result
+        resolved_command = (
+            result.get("command") if isinstance(result, dict) else command_or_alias
+        )
+        lines.append(f"実行コマンド: {resolved_command}")
+        lines.append("結果: 成功")
+        lines.append(f"出力:\n{output}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def snapshot_and_save_configs(
     lab_name: str,
     mode: str = "snapshot",
@@ -906,6 +1131,15 @@ def snapshot_and_save_configs(
     ``mode="snapshot"`` の場合、``save/save-<TIMESTAMP>/<node>.conf`` に保存する。
     ``mode="startup"`` の場合、トポロジ定義の startup-config パス（未定義なら
     ``<default_startup_dir>/<node>.conf``）へ直接上書き書き込みする。
+    kind=="linux"（FRR 系）は docker exec 経由で vtysh から取得する（vtysh を
+    持たないプレーンな linux コンテナは対象外としてスキップ）。
+
+    注意: ``save_dir``/``default_startup_dir`` へのファイル書き込みは、この
+    MCP サーバーを実行しているマシンのローカルファイルシステムに対して行う。
+    ``deploy_lab`` 等と異なり ``CLAB_HOST`` 経由でリモートホスト側には書き込ま
+    ないため、リモート実行時は ``save_dir``/トポロジのディレクトリがローカルの
+    このパスと一致するように運用すること（例: リモートのラボディレクトリを
+    ローカルにマウント/同期しておく）。
 
     Args:
         lab_name: 対象ラボ名。
@@ -990,6 +1224,10 @@ def restore_startup_configs(
     topo_path: str, snapshot_name: str = "latest", save_dir: str = "save"
 ) -> str:
     """保存済みスナップショットから各ノードの startup-config パスへ設定を書き戻す。
+
+    注意: ``topo_path``/``save_dir`` はこの MCP サーバーを実行しているマシンの
+    ローカルファイルシステムから読み書きする（``snapshot_and_save_configs`` と
+    同様、``CLAB_HOST`` 経由のリモート書き込みは行わない）。
 
     Args:
         topo_path: 対象トポロジ *.clab.yml のパス。
@@ -1147,8 +1385,15 @@ def trigger_packet_capture(
     リモートホストで ``ip netns exec <container> tshark`` をバックグラウンド起動し、
     その pcap ストリームを ssh 経由でローカル Mac の Wireshark にパイプする。
 
+    注意: ``remote_host`` への ssh は、他ツールが使う ``NETMIKO_SSH_CONFIG``
+    (mgmt IP 宛の ProxyJump 設定) を経由せず、素の ``ssh <remote_host>``
+    （ユーザーの通常の ``~/.ssh/config``）で接続する。踏み台が必要な環境では
+    ``~/.ssh/config`` 側に ``remote_host`` 宛のエイリアス/ProxyJump を定義して
+    おくこと。``sudo`` は ``CLAB_SUDO`` 設定時のみ付与する。
+
     Args:
-        remote_host: Containerlab が稼働するリモートホスト（ssh 到達可能名）。
+        remote_host: Containerlab が稼働するリモートホスト（ssh 到達可能名。
+            ``~/.ssh/config`` で到達可能なエイリアスを指定できる）。
         container_name: キャプチャ対象コンテナ名（netns 名）。
         interface_name: キャプチャ対象のインターフェース名（例: eth1）。
 
@@ -1169,8 +1414,9 @@ def trigger_packet_capture(
         "/Applications/Wireshark.app/Contents/MacOS/Wireshark"
     )
 
+    sudo_prefix = "sudo " if CLAB_SUDO else ""
     remote_capture = (
-        f"sudo ip netns exec {shlex.quote(container_name)} "
+        f"{sudo_prefix}ip netns exec {shlex.quote(container_name)} "
         f"tshark -i {shlex.quote(interface_name)} -U -w -"
     )
     ssh_cmd = ["ssh", remote_host, remote_capture]
