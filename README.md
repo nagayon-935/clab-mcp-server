@@ -195,6 +195,18 @@ etc.) have no equivalent mechanism, so an `exit_code` assertion against
 them always fails with a "no `__RC__` marker" detail rather than being
 silently treated as success.
 
+### Topology YAML Auto-Discovery
+
+`inspect_lab_topology(lab_name)` (for link info) and
+`snapshot_and_save_configs(lab_name, mode="startup")` don't take a
+topology path directly — they recursively search the current working
+directory for `*.clab.yml` / `*.clab.yaml` files whose `name:` field
+matches `lab_name`. If no file's `name:` matches, they report it
+explicitly (an empty `links` list with a warning, or an error for
+`mode="startup"`) rather than guessing and falling back to an unrelated
+topology file — run the MCP server from a directory containing (or
+above) the relevant topology YAML.
+
 ### Snapshot / Restore Directory Layout
 
 ```text
@@ -276,3 +288,20 @@ docker pull ghcr.io/<owner>/<repo>:<version>
   matching ntc-templates template exists for the command. `server.py`
   automatically falls back to raw text in that case, so this is
   expected behavior, not an error.
+- **SSH to `CLAB_HOST` hangs or fails outright**: because the MCP server
+  runs non-interactively, all ssh calls use `BatchMode=yes` — they never
+  prompt for a host key or a password, they just fail fast instead. Make
+  sure the `CLAB_HOST` key is already in `known_hosts` (e.g. connect
+  once manually, or `ssh-keyscan`) and that key-based auth is set up
+  before registering the server.
+- **`CLAB_SUDO=1` fails with a sudo error instead of running**: `sudo`
+  is invoked as `sudo -n` (non-interactive) for the same reason — if the
+  remote user needs a password for `sudo`, configure passwordless sudo
+  (`NOPASSWD`) for the relevant commands on `CLAB_HOST` instead.
+- **Long-running remote commands fail with rc=124 / "timeout"**: when
+  `CLAB_HOST` is set, remote commands are wrapped in coreutils `timeout`
+  so a stalled `clab`/`docker exec` process on the remote host can't
+  turn into an orphaned/zombie process. If a legitimately slow operation
+  needs more time, it's using the timeout already passed to that tool
+  (e.g. `deploy_lab`/`destroy_lab` default to 600s) — there's currently
+  no per-call override.

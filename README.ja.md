@@ -17,8 +17,10 @@ Nornir + Netmiko によるマルチベンダー並列オペレーションを 1 
 - [Containerlab](https://containerlab.dev/) が動作するホスト（ローカル or リモート）
 - [uv](https://docs.astral.sh/uv/)（ホストで直接実行する場合。推奨）
 - Docker（コンテナで実行する場合）
-- パケットキャプチャ機能を使う場合: ローカル Mac に Wireshark、
-  リモートホストに `tshark` と ssh 到達性
+- パケットキャプチャ機能を使う場合: MCP サーバーを実行するマシン
+  （macOS / Windows / Linux。`PATH` またはプラットフォームの既定
+  インストール先から解決）に Wireshark、リモートホストに `tshark` と
+  ssh 到達性
 
 ## インストール / セットアップ
 
@@ -183,6 +185,25 @@ tests:
 `test_file_or_dir` にディレクトリを指定すると、配下の `test.yml` /
 `test.yaml` を再帰的に探索して全て実行する。
 
+**`exit_code` アサーションは `kind: linux` ノードのみ対応。** テスト
+エンジンは `linux` kind のノードに対してのみコマンド末尾に
+`; echo __RC__=$?` を付与しシェルの終了コードを回収する。それ以外の
+kind（Cisco/Arista/Juniper 等）には同等の仕組みが無いため、それらに
+対する `exit_code` アサーションは「`__RC__` マーカーが無い」旨の詳細と
+共に必ず FAIL となる（黙って成功扱いにはしない）。
+
+### トポロジ YAML の自動探索
+
+`inspect_lab_topology(lab_name)`（リンク情報の補完用）と
+`snapshot_and_save_configs(lab_name, mode="startup")` はトポロジパスを
+直接受け取らず、カレントディレクトリ配下を再帰的に探索して `name:`
+フィールドが `lab_name` と一致する `*.clab.yml` / `*.clab.yaml` を
+探す。一致するファイルが無い場合は、無関係な別ラボの YAML へ推測で
+フォールバックすることはせず、その旨を明示する（`links` を空にして
+警告を付与、または `mode="startup"` の場合はエラー）。該当のトポロジ
+YAML を含む（またはその上位の）ディレクトリから MCP サーバーを
+起動すること。
+
 ### snapshot / restore のディレクトリ構成
 
 ```text
@@ -207,6 +228,8 @@ startup-configs/
 ホストに対して使う場合は、`save_dir`/トポロジのディレクトリがローカルの
 同じパスから参照できるようにしておくこと(リモートのラボディレクトリを
 マウント/同期する等)。そうしないと実際のラボと噛み合わない。
+`CLAB_HOST` 設定時は、両ツールとも結果サマリの先頭に `⚠` 警告行を
+付与し、この注意点を実行時にも思い出せるようにしている。
 
 ## 開発
 
@@ -262,3 +285,20 @@ docker pull ghcr.io/<owner>/<repo>:<version>
 - **`use_textfsm` の解析結果が生テキストになる**: 対応する
   ntc-templates が無いコマンド。`server.py` 内で自動的に生テキストへ
   フォールバックする仕様のため異常ではない。
+- **`CLAB_HOST` への ssh がハングする / いきなり失敗する**: MCP
+  サーバーは非対話で動作するため、全ての ssh 呼び出しは
+  `BatchMode=yes` で実行される（ホストキーやパスワードのプロンプトを
+  一切出さず即座に失敗する）。事前に `CLAB_HOST` のホストキーを
+  `known_hosts` に登録しておく（一度手動で接続する、または
+  `ssh-keyscan` を使う）こと、および鍵認証を設定しておくことが必須。
+- **`CLAB_SUDO=1` が sudo エラーで失敗する**: 同じ理由で `sudo` は
+  `sudo -n`（非対話）で実行される。リモートユーザーの `sudo` にパス
+  ワードが必要な場合は、対象コマンドについて `CLAB_HOST` 側で
+  パスワード無し sudo（`NOPASSWD`）を設定すること。
+- **長時間実行コマンドが rc=124（timeout）で失敗する**: `CLAB_HOST`
+  設定時、リモートコマンドは coreutils の `timeout` でラップされて
+  おり、リモート側の `clab`/`docker exec` プロセスが固まった場合でも
+  孤児化・ゾンビ化しないようになっている。正当に時間のかかる処理が
+  タイムアウトする場合は、そのツールに渡されているタイムアウト値
+  （例: `deploy_lab`/`destroy_lab` は既定 600秒）が上限であり、現状
+  呼び出し単位での上書きはできない。
