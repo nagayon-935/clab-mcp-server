@@ -166,20 +166,47 @@ CLAB_TO_PLATFORM: dict[str, str] = {
 # === Config / Env ============================================================
 # =============================================================================
 
+# MCP は stdout を JSON-RPC 専用に使うため、ログは必ず stderr へ出す。
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+logger = logging.getLogger("clab_hybrid")
+
+
+def _env_int(name: str, default: int) -> int:
+    """環境変数を int として読む。不正値は警告を出して既定値へフォールバックする。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "環境変数 %s の値 %r を整数として解釈できません。既定値 %d を使用します",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
 CLAB_BIN = os.environ.get("CLAB_BIN", "clab")
 CLAB_HOST = os.environ.get("CLAB_HOST")
 CLAB_SSH_USER = os.environ.get("CLAB_SSH_USER")
 CLAB_SUDO = os.environ.get("CLAB_SUDO", "0") in ("1", "true", "yes")
 CLAB_API_URL = os.environ.get("CLAB_API_URL")
-NORNIR_WORKERS = int(os.environ.get("NORNIR_WORKERS", "20"))
-NETMIKO_READ_TIMEOUT = int(os.environ.get("NETMIKO_READ_TIMEOUT", "60"))
+NORNIR_WORKERS = _env_int("NORNIR_WORKERS", 20)
+NETMIKO_READ_TIMEOUT = _env_int("NETMIKO_READ_TIMEOUT", 60)
 NETMIKO_SSH_CONFIG = os.environ.get("NETMIKO_SSH_CONFIG")
 
 DEFAULT_LINUX_DEVICE_TYPE = "linux"
 
-# MCP は stdout を JSON-RPC 専用に使うため、ログは必ず stderr へ出す。
-logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
-logger = logging.getLogger("clab_hybrid")
+# MCP サーバーは非対話で動くため、ssh がホストキー確認やパスワード入力の
+# プロンプトを出すと入力待ちで永久にハングする。リモート実行はすべて
+# 非対話モード（BatchMode）で行い、接続確立にも上限を設ける。
+SSH_BATCH_OPTS: list[str] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+# CLAB_HOST 実行時はリモート側の coreutils timeout を先に発火させ、rc=124 と
+# stderr を回収できるよう、ローカル subprocess の timeout にはこのマージン秒を足す。
+REMOTE_TIMEOUT_MARGIN = 10
 
 mcp = FastMCP("clab-hybrid")
 
@@ -188,42 +215,67 @@ mcp = FastMCP("clab-hybrid")
 # === Clab Introspection (subprocess / optional httpx) =========================
 # =============================================================================
 
-def _remote_argv(local: list[str]) -> list[str]:
+def _remote_argv(local: list[str], timeout: Optional[int] = None) -> list[str]:
     """ローカル argv を、``CLAB_HOST`` 設定時は ssh 経由のリモート argv にラップする。
 
     ``clab`` サブプロセスに限らず、docker exec など「containerlab ホスト上で
     実行すべきコマンド」全般で共有する変換ロジック。
+
+    ``timeout`` を指定すると、リモートコマンドを coreutils の ``timeout`` で
+    ラップする。ローカル側の ``subprocess.run(timeout=...)`` はローカルの ssh
+    プロセスしか強制終了できず、リモート側で起動された実際の clab/docker exec
+    プロセスには終了シグナルが伝わらずゾンビ化しうるため、リモート側にも
+    自前でタイムアウトを課す。ssh 自体は ``BatchMode=yes`` で非対話にし、
+    ホストキー確認やパスワード入力プロンプトによる無限ハングを防ぐ。
     """
     if not CLAB_HOST:
         return local
     target = f"{CLAB_SSH_USER}@{CLAB_HOST}" if CLAB_SSH_USER else CLAB_HOST
-    remote_cmd = " ".join(shlex.quote(part) for part in local)
-    return ["ssh", target, remote_cmd]
+    remote = [*local]
+    if timeout is not None:
+        remote = ["timeout", str(timeout), *remote]
+    remote_cmd = " ".join(shlex.quote(part) for part in remote)
+    return ["ssh", *SSH_BATCH_OPTS, target, remote_cmd]
 
 
-def _clab_argv(args: list[str]) -> list[str]:
+def _clab_argv(args: list[str], timeout: Optional[int] = None) -> list[str]:
     """clab 呼び出しの argv を組み立てる（ローカル or ssh リモート）。"""
     local = []
     if CLAB_SUDO:
         local.append("sudo")
+        local.append("-n")
     local += [CLAB_BIN, *args]
-    return _remote_argv(local)
+    return _remote_argv(local, timeout=timeout)
 
 
 def _run_argv(argv: list[str], timeout: int, label: str) -> subprocess.CompletedProcess:
-    """任意の argv を実行し CompletedProcess を返す（バイナリ不在/タイムアウトは RuntimeError）。"""
+    """任意の argv を実行し CompletedProcess を返す（バイナリ不在/タイムアウトは RuntimeError）。
+
+    ``stdin=subprocess.DEVNULL`` を指定し、MCP サーバーの stdin（LLM との
+    JSON-RPC 通信ストリーム）を子プロセス（ssh 等）が誤って継承・消費しない
+    ようにする。継承したままだと ssh のパスワードプロンプト待ちで通信が
+    壊れたりハングしたりする。
+    """
     try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+        )
     except FileNotFoundError as exc:  # 対象バイナリ（clab / docker / ssh）が無い
         raise RuntimeError(f"実行バイナリが見つかりません: {argv[0]!r} ({exc})") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"{label} がタイムアウトしました") from exc
+        raise RuntimeError(
+            f"{label} がタイムアウトしました"
+            "（CLAB_HOST 使用時はリモート側の timeout ラップにより通常はリモート"
+            "プロセスも終了しますが、ネットワーク断等で残存する可能性があります）"
+        ) from exc
 
 
 def _run_clab(args: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
     """clab コマンドを実行し CompletedProcess を返す。失敗時は RuntimeError。"""
-    argv = _clab_argv(args)
-    proc = _run_argv(argv, timeout, f"clab コマンド: {' '.join(args)}")
+    remote_timeout = timeout if CLAB_HOST else None
+    argv = _clab_argv(args, timeout=remote_timeout)
+    local_timeout = timeout + REMOTE_TIMEOUT_MARGIN if CLAB_HOST else timeout
+    proc = _run_argv(argv, local_timeout, f"clab コマンド: {' '.join(args)}")
     if proc.returncode != 0:
         raise RuntimeError(
             f"clab コマンド失敗 (rc={proc.returncode}): {' '.join(args)}\n"
@@ -337,7 +389,14 @@ def _load_topo_yaml(topo_path: str) -> dict[str, Any]:
 
 
 def _find_topo_for_lab(lab_name: str) -> Optional[str]:
-    """カレントディレクトリ配下から lab_name に一致する *.clab.yml を探す。"""
+    """カレントディレクトリ配下から lab_name に一致する *.clab.yml を探す。
+
+    ``name`` が一致するファイルが見つからない場合は None を返す。カレント
+    ディレクトリに複数ラボのトポロジ YAML が存在しうる環境で、無関係な
+    候補（例: 最初に見つかった別ラボのファイル）へフォールバックすると、
+    ``snapshot_and_save_configs(mode="startup")`` 等で別ラボの
+    startup-config を誤って上書きする恐れがあるため、フォールバックはしない。
+    """
     candidates = glob.glob("**/*.clab.yml", recursive=True) + glob.glob(
         "**/*.clab.yaml", recursive=True
     )
@@ -348,7 +407,7 @@ def _find_topo_for_lab(lab_name: str) -> Optional[str]:
             continue
         if data.get("name") == lab_name:
             return path
-    return candidates[0] if candidates else None
+    return None
 
 
 def _topo_nodes_and_links(topo: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
@@ -377,6 +436,24 @@ def _safe_join(base_dir: str, *parts: str) -> str:
 def _ensure_parent_dir(path: str) -> None:
     """ファイルの親ディレクトリを作成する（存在しなければ）。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+
+def _clab_host_fs_warning() -> list[str]:
+    """CLAB_HOST 使用時、snapshot/restore がローカル FS にしか読み書きしない旨の警告行。
+
+    snapshot_and_save_configs / restore_startup_configs はこの MCP サーバーの
+    ローカルファイルシステムに対してのみ読み書きする（``deploy_lab`` 等と異なり
+    リモートホストへは書き込まない）。CLAB_HOST 設定時にこれを黙って実行すると、
+    「ローカルに保存したのにリモートに反映されない」といった不整合に気付き
+    にくいため、結果サマリの先頭に明示する。
+    """
+    if not CLAB_HOST:
+        return []
+    return [
+        f"⚠ CLAB_HOST={CLAB_HOST} が設定されていますが、ファイル読み書きはこの MCP "
+        "サーバーのローカルファイルシステムに対して行われました。リモート側と"
+        "ディレクトリを同期していない場合、復元/デプロイに反映されません。",
+    ]
 
 
 def _startup_path_for_node(
@@ -524,13 +601,16 @@ def resolve_command(command_or_alias: str, kind: str) -> str:
     return aliases.get(kind, command_or_alias)  # kind 未定義ならリテラルにフォールバック
 
 
-def _docker_exec_argv(container: str, command: str) -> list[str]:
+def _docker_exec_argv(
+    container: str, command: str, timeout: Optional[int] = None
+) -> list[str]:
     """linux kind ノードへの docker exec 呼び出し argv を組み立てる。"""
     local = []
     if CLAB_SUDO:
         local.append("sudo")
+        local.append("-n")
     local += ["docker", "exec", container, "sh", "-c", command]
-    return _remote_argv(local)
+    return _remote_argv(local, timeout=timeout)
 
 
 def _run_docker_exec(container: str, command: str, timeout: int) -> str:
@@ -541,8 +621,10 @@ def _run_docker_exec(container: str, command: str, timeout: int) -> str:
     scripts/clab-cli と同じ方式）。``CLAB_HOST`` 設定時は ssh 経由でリモートの
     containerlab ホスト上で docker exec を実行する。
     """
-    argv = _docker_exec_argv(container, command)
-    proc = _run_argv(argv, timeout, f"docker exec ({container})")
+    remote_timeout = timeout if CLAB_HOST else None
+    argv = _docker_exec_argv(container, command, timeout=remote_timeout)
+    local_timeout = timeout + REMOTE_TIMEOUT_MARGIN if CLAB_HOST else timeout
+    proc = _run_argv(argv, local_timeout, f"docker exec ({container})")
     if proc.returncode != 0:
         raise RuntimeError(
             f"docker exec 失敗 (rc={proc.returncode}): "
@@ -750,7 +832,16 @@ def _evaluate_assertion(output: str, assertion: dict[str, Any]) -> tuple[bool, s
     if "exit_code" in assertion:
         expected = int(assertion["exit_code"])
         match = re.search(r"__RC__=(\d+)", output)
-        actual = int(match.group(1)) if match else 0
+        if not match:
+            # __RC__ マーカーの付与は linux kind のみ（_run_test_case 参照）。
+            # マーカーが無い場合に actual=0 とみなすと、コマンド自体が失敗
+            # している NOS ノードでも exit_code: 0 が誤って PASS してしまう
+            # ため、判定不能として明示的に FAIL とする。
+            return False, (
+                "exit_code 判定不能: 出力に __RC__ マーカーがありません"
+                "（exit_code アサーションは linux kind のみサポートしています）"
+            )
+        actual = int(match.group(1))
         ok = actual == expected
         return ok, f"exit_code expected={expected} actual={actual}: {'OK' if ok else 'NG'}"
 
@@ -1206,10 +1297,9 @@ def snapshot_and_save_configs(
         except OSError as exc:
             errors.append(f"{host_name}: 書き込み失敗 {exc}")
 
-    summary = [
-        f"[snapshot_and_save_configs] mode={mode}",
-        f"保存成功: {len(saved)} 件",
-    ]
+    summary = [f"[snapshot_and_save_configs] mode={mode}"]
+    summary += _clab_host_fs_warning()
+    summary.append(f"保存成功: {len(saved)} 件")
     summary += [f"  - {p}" for p in saved]
     if skipped:
         summary.append(f"スキップ(設定取得対象外): {', '.join(skipped)}")
@@ -1280,10 +1370,9 @@ def restore_startup_configs(
         except OSError as exc:
             errors.append(f"{node_name}: {exc}")
 
-    summary = [
-        f"[restore_startup_configs] スナップショット: {snapshot_dir}",
-        f"復元成功: {len(restored)} 件",
-    ]
+    summary = [f"[restore_startup_configs] スナップショット: {snapshot_dir}"]
+    summary += _clab_host_fs_warning()
+    summary.append(f"復元成功: {len(restored)} 件")
     summary += [f"  - {r}" for r in restored]
     if missing:
         summary.append(f"スナップショットに設定が無いノード: {', '.join(missing)}")
@@ -1376,6 +1465,31 @@ def run_topology_tests(test_file_or_dir: str) -> str:
     return "\n".join(header + report_lines)
 
 
+def _find_wireshark() -> Optional[str]:
+    """Wireshark 実行ファイルを OS 非依存に探索する。見つからなければ None。
+
+    PATH 上の ``wireshark``/``Wireshark`` を優先し、無ければ主要 OS の既定
+    インストール先を確認する。macOS 専用の絶対パスをハードコードしていた
+    旧実装は Windows/Linux クライアントから呼ぶと必ず失敗していたため、
+    プラットフォーム別の候補リストに分離した。
+    """
+    found = shutil.which("wireshark") or shutil.which("Wireshark")
+    if found:
+        return found
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        candidates.append("/Applications/Wireshark.app/Contents/MacOS/Wireshark")
+    elif sys.platform.startswith("win"):
+        candidates += [
+            r"C:\Program Files\Wireshark\Wireshark.exe",
+            r"C:\Program Files (x86)\Wireshark\Wireshark.exe",
+        ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 @mcp.tool()
 def trigger_packet_capture(
     remote_host: str, container_name: str, interface_name: str
@@ -1383,13 +1497,13 @@ def trigger_packet_capture(
     """リモートホスト上のコンテナIFを tshark でキャプチャし、ローカル Wireshark に流す。
 
     リモートホストで ``ip netns exec <container> tshark`` をバックグラウンド起動し、
-    その pcap ストリームを ssh 経由でローカル Mac の Wireshark にパイプする。
+    その pcap ストリームを ssh 経由でローカルの Wireshark にパイプする。
 
     注意: ``remote_host`` への ssh は、他ツールが使う ``NETMIKO_SSH_CONFIG``
     (mgmt IP 宛の ProxyJump 設定) を経由せず、素の ``ssh <remote_host>``
     （ユーザーの通常の ``~/.ssh/config``）で接続する。踏み台が必要な環境では
     ``~/.ssh/config`` 側に ``remote_host`` 宛のエイリアス/ProxyJump を定義して
-    おくこと。``sudo`` は ``CLAB_SUDO`` 設定時のみ付与する。
+    おくこと。``sudo`` は ``CLAB_SUDO`` 設定時のみ非対話（``-n``）で付与する。
 
     Args:
         remote_host: Containerlab が稼働するリモートホスト（ssh 到達可能名。
@@ -1410,20 +1524,39 @@ def trigger_packet_capture(
         if not value or not token.match(value):
             return f"[trigger_packet_capture] エラー: 不正な {label}: {value!r}"
 
-    wireshark = shutil.which("wireshark") or (
-        "/Applications/Wireshark.app/Contents/MacOS/Wireshark"
-    )
+    wireshark = _find_wireshark()
+    if not wireshark:
+        return (
+            "[trigger_packet_capture] エラー: Wireshark が見つかりません。"
+            "インストールするか PATH に追加してください"
+        )
 
-    sudo_prefix = "sudo " if CLAB_SUDO else ""
+    sudo_prefix = "sudo -n " if CLAB_SUDO else ""
     remote_capture = (
         f"{sudo_prefix}ip netns exec {shlex.quote(container_name)} "
         f"tshark -i {shlex.quote(interface_name)} -U -w -"
     )
-    ssh_cmd = ["ssh", remote_host, remote_capture]
+    # -n: ssh 自身の stdin を継承しない（MCP サーバーの JSON-RPC ストリーム
+    #     を誤って消費しないため）。BatchMode によりホストキー/パスワード
+    #     プロンプトでもハングしない。ServerAlive* により、ネットワーク瞬断
+    #     時に ssh 自身が自律的に終了し、Wireshark 側は EOF でキャプチャを
+    #     止める（リモート側の後始末は下記の監視スレッドが担う）。
+    ssh_cmd = [
+        "ssh",
+        "-n",
+        *SSH_BATCH_OPTS,
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+        remote_host,
+        remote_capture,
+    ]
 
     try:
         ssh_proc = subprocess.Popen(
             ssh_cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
@@ -1435,12 +1568,27 @@ def trigger_packet_capture(
         )
         if ssh_proc.stdout:
             ssh_proc.stdout.close()  # SIGPIPE を Wireshark 側へ伝播させる
-        # fire-and-forget な子プロセスなのでここではブロックせず、終了を
-        # バックグラウンドスレッドで待ち受けてゾンビ化を防ぐ。
-        threading.Thread(
-            target=lambda: (ssh_proc.wait(), ws_proc.wait()),
-            daemon=True,
-        ).start()
+
+        def _wait_and_cleanup() -> None:
+            """Wireshark 終了後、ssh（延いてはリモート tshark）を確実に終了させる。
+
+            ユーザーが Wireshark を閉じても SIGPIPE がリモート tshark まで
+            正しく伝播しない場合があるため、ssh がまだ生きていれば明示的に
+            terminate/kill する。ssh の切断により sshd がリモートプロセスへ
+            SIGHUP を送るため、リモート側の tshark ゾンビ化も防げる。
+            """
+            ws_proc.wait()
+            if ssh_proc.poll() is None:
+                ssh_proc.terminate()
+                try:
+                    ssh_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    ssh_proc.kill()
+                    ssh_proc.wait()
+            else:
+                ssh_proc.wait()
+
+        threading.Thread(target=_wait_and_cleanup, daemon=True).start()
     except FileNotFoundError as exc:
         return f"[trigger_packet_capture] エラー: 実行バイナリが見つかりません: {exc}"
     except Exception as exc:  # noqa: BLE001

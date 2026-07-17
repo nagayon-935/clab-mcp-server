@@ -209,6 +209,10 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Claude Code local configuration
+CLAUDE.md
+.mcp.json
+
 # macOS
 .DS_Store
 .AppleDouble

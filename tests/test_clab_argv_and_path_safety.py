@@ -1,4 +1,5 @@
 import shlex
+from types import SimpleNamespace
 
 import server
 
@@ -25,8 +26,10 @@ def test_clab_argv_wraps_in_ssh_when_host_set(monkeypatch):
     monkeypatch.setattr(server, "CLAB_SSH_USER", None)
     monkeypatch.setattr(server, "CLAB_SUDO", False)
     argv = server._clab_argv(["inspect", "--name", "mylab"])
-    assert argv[:2] == ["ssh", "clab-host"]
-    assert argv[2] == "clab inspect --name mylab"
+    assert argv[0] == "ssh"
+    assert argv[-2:] == ["clab-host", "clab inspect --name mylab"]
+    # non-interactive ssh: never blocks on host-key/password prompts
+    assert "-o" in argv and "BatchMode=yes" in argv
 
 
 def test_clab_argv_uses_user_at_host_when_ssh_user_set(monkeypatch):
@@ -34,7 +37,7 @@ def test_clab_argv_uses_user_at_host_when_ssh_user_set(monkeypatch):
     monkeypatch.setattr(server, "CLAB_SSH_USER", "admin")
     monkeypatch.setattr(server, "CLAB_SUDO", False)
     argv = server._clab_argv(["inspect"])
-    assert argv[1] == "admin@clab-host"
+    assert argv[-2] == "admin@clab-host"
 
 
 def test_clab_argv_shell_quotes_args_against_injection(monkeypatch):
@@ -45,8 +48,49 @@ def test_clab_argv_shell_quotes_args_against_injection(monkeypatch):
     # Exactly one remote-command argv element passed to ssh (not shell=True
     # locally), so a POSIX shell on the remote end must parse it back to the
     # literal tokens below rather than executing an injected command.
-    assert len(argv) == 3
-    assert shlex.split(argv[2]) == ["clab", "deploy", "-t", "; rm -rf / #"]
+    assert shlex.split(argv[-1]) == ["clab", "deploy", "-t", "; rm -rf / #"]
+
+
+def test_clab_argv_wraps_remote_command_in_timeout_when_timeout_given(monkeypatch):
+    monkeypatch.setattr(server, "CLAB_HOST", "clab-host")
+    monkeypatch.setattr(server, "CLAB_SSH_USER", None)
+    monkeypatch.setattr(server, "CLAB_SUDO", False)
+    argv = server._clab_argv(["inspect"], timeout=42)
+    assert shlex.split(argv[-1]) == ["timeout", "42", "clab", "inspect"]
+
+
+def test_clab_argv_sudo_is_noninteractive(monkeypatch):
+    monkeypatch.setattr(server, "CLAB_HOST", None)
+    monkeypatch.setattr(server, "CLAB_SUDO", True)
+    assert server._clab_argv(["deploy"])[:2] == ["sudo", "-n"]
+
+
+def test_run_argv_never_inherits_stdin(monkeypatch):
+    """子プロセス（ssh 等）が MCP サーバーの stdin（LLM との JSON-RPC ストリーム）
+    を継承・消費しないこと。継承したままだと通信破壊やパスワードプロンプト
+    待ちの無限ハングにつながる。"""
+    captured_kwargs = {}
+
+    def fake_run(argv, **kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    server._run_argv(["clab", "inspect"], timeout=10, label="test")
+
+    assert captured_kwargs["stdin"] == server.subprocess.DEVNULL
+
+
+def test_clab_host_fs_warning_empty_when_no_clab_host(monkeypatch):
+    monkeypatch.setattr(server, "CLAB_HOST", None)
+    assert server._clab_host_fs_warning() == []
+
+
+def test_clab_host_fs_warning_present_when_clab_host_set(monkeypatch):
+    monkeypatch.setattr(server, "CLAB_HOST", "clab-host")
+    warning = server._clab_host_fs_warning()
+    assert len(warning) == 1
+    assert "clab-host" in warning[0]
 
 
 def test_restore_startup_configs_rejects_snapshot_name_traversal(tmp_path, monkeypatch):

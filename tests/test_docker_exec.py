@@ -22,8 +22,8 @@ def test_docker_exec_argv_adds_sudo_when_enabled(monkeypatch):
     monkeypatch.setattr(server, "CLAB_HOST", None)
     monkeypatch.setattr(server, "CLAB_SUDO", True)
     argv = server._docker_exec_argv("clab-x-r1", "uptime")
-    assert argv[0] == "sudo"
-    assert argv[1:] == ["docker", "exec", "clab-x-r1", "sh", "-c", "uptime"]
+    assert argv[:2] == ["sudo", "-n"]
+    assert argv[2:] == ["docker", "exec", "clab-x-r1", "sh", "-c", "uptime"]
 
 
 def test_docker_exec_argv_wraps_in_ssh_when_host_set(monkeypatch):
@@ -31,8 +31,18 @@ def test_docker_exec_argv_wraps_in_ssh_when_host_set(monkeypatch):
     monkeypatch.setattr(server, "CLAB_SSH_USER", None)
     monkeypatch.setattr(server, "CLAB_SUDO", False)
     argv = server._docker_exec_argv("clab-x-r1", "uptime")
-    assert argv[:2] == ["ssh", "clab-host"]
-    assert argv[2] == "docker exec clab-x-r1 sh -c uptime"
+    assert argv[0] == "ssh"
+    assert argv[-2:] == ["clab-host", "docker exec clab-x-r1 sh -c uptime"]
+
+
+def test_docker_exec_argv_wraps_remote_command_in_timeout_when_timeout_given(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "CLAB_HOST", "clab-host")
+    monkeypatch.setattr(server, "CLAB_SSH_USER", None)
+    monkeypatch.setattr(server, "CLAB_SUDO", False)
+    argv = server._docker_exec_argv("clab-x-r1", "uptime", timeout=30)
+    assert argv[-1].startswith("timeout 30 ")
 
 
 def test_run_docker_exec_returns_stdout_on_success(monkeypatch):

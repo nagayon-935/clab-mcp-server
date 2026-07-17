@@ -27,6 +27,26 @@ TOPO_TRAVERSAL = {
 }
 
 
+def test_find_topo_for_lab_returns_none_when_no_name_matches(tmp_path, monkeypatch):
+    """name が一致するトポロジが無い場合、無関係な別ラボの YAML へ
+    フォールバックしないこと（誤って別ラボの startup-config を上書きする
+    事故を防ぐため、最初に見つかった候補を返す旧フォールバックは廃止した）。"""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "other.clab.yml").write_text("name: other-lab\ntopology: {}\n")
+
+    assert server._find_topo_for_lab("mylab") is None
+
+
+def test_find_topo_for_lab_returns_matching_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "other.clab.yml").write_text("name: other-lab\ntopology: {}\n")
+    (tmp_path / "mylab.clab.yml").write_text("name: mylab\ntopology: {}\n")
+
+    result = server._find_topo_for_lab("mylab")
+
+    assert result == "mylab.clab.yml"
+
+
 def test_topo_nodes_and_links_extracts_both_sections():
     nodes, links = server._topo_nodes_and_links(TOPO)
     assert set(nodes.keys()) == {"r1", "r2"}

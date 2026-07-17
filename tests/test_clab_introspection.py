@@ -44,3 +44,44 @@ def test_normalize_inspect_json_accepts_labname_keyed_dict():
 def test_normalize_inspect_json_raises_on_unrecognized_structure():
     with pytest.raises(RuntimeError):
         server._normalize_inspect_json("not a valid structure")
+
+
+def test_env_int_returns_default_when_unset(monkeypatch):
+    monkeypatch.delenv("SOME_UNSET_INT_VAR", raising=False)
+    assert server._env_int("SOME_UNSET_INT_VAR", 20) == 20
+
+
+def test_env_int_parses_valid_value(monkeypatch):
+    monkeypatch.setenv("SOME_INT_VAR", "42")
+    assert server._env_int("SOME_INT_VAR", 20) == 42
+
+
+def test_env_int_falls_back_to_default_on_invalid_value(monkeypatch):
+    """不正な値で起動時に例外クラッシュせず、警告のみで既定値へフォールバックすること。"""
+    monkeypatch.setenv("SOME_BAD_INT_VAR", "not-a-number")
+    assert server._env_int("SOME_BAD_INT_VAR", 20) == 20
+
+
+def test_find_wireshark_prefers_path_lookup(monkeypatch):
+    monkeypatch.setattr(server.shutil, "which", lambda name: "/usr/bin/wireshark")
+    assert server._find_wireshark() == "/usr/bin/wireshark"
+
+
+def test_find_wireshark_returns_none_when_not_found_anywhere(monkeypatch):
+    monkeypatch.setattr(server.shutil, "which", lambda name: None)
+    monkeypatch.setattr(server.os.path, "isfile", lambda path: False)
+    assert server._find_wireshark() is None
+
+
+def test_find_wireshark_falls_back_to_platform_path_on_macos(monkeypatch):
+    monkeypatch.setattr(server.shutil, "which", lambda name: None)
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        server.os.path,
+        "isfile",
+        lambda path: path == "/Applications/Wireshark.app/Contents/MacOS/Wireshark",
+    )
+    assert (
+        server._find_wireshark()
+        == "/Applications/Wireshark.app/Contents/MacOS/Wireshark"
+    )

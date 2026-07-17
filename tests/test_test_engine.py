@@ -29,6 +29,16 @@ def test_evaluate_assertion_exit_code():
     assert ok is False
 
 
+def test_evaluate_assertion_exit_code_fails_when_marker_missing():
+    """__RC__ マーカーは linux kind のみ付与される。NOS ノード等でマーカーが
+    無い出力を actual=0 とみなして誤 PASS させないこと（マーカー無し=FAIL）。"""
+    ok, detail = server._evaluate_assertion(
+        "% Invalid input detected", {"exit_code": 0}
+    )
+    assert ok is False
+    assert "__RC__" in detail
+
+
 def test_evaluate_assertion_no_condition_fails_with_message():
     ok, detail = server._evaluate_assertion("anything", {})
     assert ok is False

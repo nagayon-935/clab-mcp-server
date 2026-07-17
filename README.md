@@ -18,8 +18,10 @@ entire implementation lives in the single file [server.py](server.py).
 - A host running [Containerlab](https://containerlab.dev/) (local or remote)
 - [uv](https://docs.astral.sh/uv/) (recommended for running directly on a host)
 - Docker (for running in a container)
-- For packet capture: Wireshark on your local Mac, and `tshark` plus SSH
-  reachability on the remote host
+- For packet capture: Wireshark on the machine running the MCP server
+  (macOS, Windows, or Linux — resolved via `PATH` or the platform's
+  default install location), and `tshark` plus SSH reachability on the
+  remote host
 
 ## Installation / Setup
 
@@ -186,6 +188,13 @@ tests:
 If `test_file_or_dir` points to a directory, all `test.yml` /
 `test.yaml` files under it are discovered recursively and executed.
 
+**`exit_code` assertions only work on `kind: linux` nodes.** The test
+engine appends `; echo __RC__=$?` to the command on `linux`-kind nodes
+to capture the shell exit status; other kinds (Cisco/Arista/Juniper
+etc.) have no equivalent mechanism, so an `exit_code` assertion against
+them always fails with a "no `__RC__` marker" detail rather than being
+silently treated as success.
+
 ### Snapshot / Restore Directory Layout
 
 ```text
@@ -210,6 +219,8 @@ go through `CLAB_HOST` over ssh. When running against a remote
 containerlab host, make sure `save_dir`/the topology's directory is
 reachable at the same local path (e.g. mount or sync the remote lab
 directory) or these two tools won't line up with the actual lab.
+Both tools now prepend a `⚠` warning line to their result summary
+whenever `CLAB_HOST` is set, as a runtime reminder of this caveat.
 
 ## Development
 
