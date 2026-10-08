@@ -1,6 +1,8 @@
 import shlex
 from types import SimpleNamespace
 
+import pytest
+
 import server
 
 
@@ -79,6 +81,32 @@ def test_run_argv_never_inherits_stdin(monkeypatch):
     server._run_argv(["clab", "inspect"], timeout=10, label="test")
 
     assert captured_kwargs["stdin"] == server.subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("command", ["clab", "docker"])
+def test_host_command_timeout_policy_is_shared(monkeypatch, remote, command):
+    monkeypatch.setattr(server, "CLAB_HOST", "host" if remote else None)
+    monkeypatch.setattr(server, "CLAB_SUDO", False)
+    monkeypatch.setattr(server, "CLAB_SSH_USER", None)
+    calls = []
+
+    def fake_run(argv, timeout, label):
+        calls.append((argv, timeout))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(server, "_run_argv", fake_run)
+    if command == "clab":
+        server._run_clab(["inspect"], timeout=30)
+    else:
+        server._run_docker_exec("clab-x-r1", "uptime", timeout=30)
+    argv, timeout = calls[0]
+    assert timeout == 30 + (server.REMOTE_TIMEOUT_MARGIN if remote else 0)
+    if remote:
+        assert argv[0] == "ssh"
+        assert shlex.split(argv[-1])[:3] == ["timeout", "30", command]
+    else:
+        assert argv[0] == command
 
 
 def test_clab_host_fs_warning_empty_when_no_clab_host(monkeypatch):

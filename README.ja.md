@@ -162,6 +162,7 @@ run_parallel_command(lab_name="mylab", command_or_alias="show version", node_fil
   `scripts/clab-cli` と同じ方式）。`CLAB_HOST` 設定時は Docker がリモート
   ホスト側にしか存在しないため、ssh 経由でそのリモートホスト上で
   `docker exec` を実行する（ローカルでは実行しない）。
+  管理IPを持たない Linux ノードも操作対象になる。
 - **それ以外の kind**（`cisco_xrd`, `arista_ceos`, `juniper_crpd` 等）:
   上記のとおり Netmiko/SSH でノードの mgmt IP へ接続する。
 
@@ -185,12 +186,11 @@ tests:
 `test_file_or_dir` にディレクトリを指定すると、配下の `test.yml` /
 `test.yaml` を再帰的に探索して全て実行する。
 
-**`exit_code` アサーションは `kind: linux` ノードのみ対応。** テスト
-エンジンは `linux` kind のノードに対してのみコマンド末尾に
-`; echo __RC__=$?` を付与しシェルの終了コードを回収する。それ以外の
-kind（Cisco/Arista/Juniper 等）には同等の仕組みが無いため、それらに
-対する `exit_code` アサーションは「`__RC__` マーカーが無い」旨の詳細と
-共に必ず FAIL となる（黙って成功扱いにはしない）。
+**`exit_code` アサーションは `kind: linux` ノードのみ対応。** コマンドを
+子シェルで実行し、`exit` や末尾コメントがあっても終了コードを回収する。
+それ以外の kind（Cisco/Arista/Juniper 等）は、コマンド実行前に
+非対応のアサーションとして FAIL を返す。
+不正なテストファイルやラボ名の未指定も、サマリの失敗件数に含まれる。
 
 ### トポロジ YAML の自動探索
 
@@ -208,7 +208,7 @@ YAML を含む（またはその上位の）ディレクトリから MCP サー�
 
 ```text
 save/
-  save-20260703-021500/
+  save-20260703-021500-123456-abcdefgh/
     r1.conf
     r2.conf
 startup-configs/
@@ -219,6 +219,11 @@ startup-configs/
 `docker exec ... vtysh -c 'show running-config'` 経由で取得するように
 なった。`vtysh` を持たないプレーンな linux コンテナ（L2スイッチ役等）は、
 `KIND_COMMAND` 未定義の kind と同様に取得対象外としてスキップされる。
+接続失敗やタイムアウトはエラーとして報告される。スナップショット名には
+マイクロ秒と一意な接尾辞が含まれ、同時保存による上書きを防ぐ。
+既存の `save-<timestamp>` ディレクトリも復元できる。明示名・`latest` の
+どちらも `save_dir` 配下のディレクトリに限定し、保存先外を指す
+シンボリックリンクは拒否する。
 
 **ローカルファイルシステムに関する注意:** `deploy_lab`/`destroy_lab` 等と
 異なり、`snapshot_and_save_configs`/`restore_startup_configs` のファイル

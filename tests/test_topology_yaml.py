@@ -103,3 +103,26 @@ def test_safe_join_allows_nested_relative_path(tmp_path):
 def test_safe_join_rejects_escape_attempts(tmp_path, evil):
     with pytest.raises(ValueError):
         server._safe_join(str(tmp_path), evil)
+
+
+def test_find_topo_skips_malformed_yaml(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "broken.clab.yml").write_text("name: [", encoding="utf-8")
+    (tmp_path / "valid.clab.yml").write_text("name: x", encoding="utf-8")
+    assert server._find_topo_for_lab("x") == "valid.clab.yml"
+
+
+@pytest.mark.parametrize("content", [
+    "name: [", "topology: text", "topology: {nodes: [r1]}",
+    "topology: {nodes: {r1: text}}", "topology: {links: text}",
+    "topology: {nodes: {r1: {startup-config: 42}}}",
+])
+def test_load_topo_normalizes_invalid_yaml_errors(tmp_path, content):
+    path = tmp_path / "invalid.clab.yml"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        server._load_topo_yaml(str(path))
+
+
+def test_safe_join_allows_root_base():
+    assert server._safe_join(os.path.abspath(os.sep), "tmp") == os.path.realpath("/tmp")

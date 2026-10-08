@@ -44,6 +44,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import datetime
 from typing import Any, Callable, Optional
@@ -240,11 +241,13 @@ def _remote_argv(local: list[str], timeout: Optional[int] = None) -> list[str]:
 
 def _clab_argv(args: list[str], timeout: Optional[int] = None) -> list[str]:
     """clab 呼び出しの argv を組み立てる（ローカル or ssh リモート）。"""
-    local = []
+    return _host_argv([CLAB_BIN, *args], timeout=timeout)
+
+
+def _host_argv(local: list[str], timeout: Optional[int] = None) -> list[str]:
+    """ホストコマンドに非対話 sudo とリモート実行設定を適用する。"""
     if CLAB_SUDO:
-        local.append("sudo")
-        local.append("-n")
-    local += [CLAB_BIN, *args]
+        local = ["sudo", "-n", *local]
     return _remote_argv(local, timeout=timeout)
 
 
@@ -272,16 +275,23 @@ def _run_argv(argv: list[str], timeout: int, label: str) -> subprocess.Completed
 
 def _run_clab(args: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
     """clab コマンドを実行し CompletedProcess を返す。失敗時は RuntimeError。"""
-    remote_timeout = timeout if CLAB_HOST else None
-    argv = _clab_argv(args, timeout=remote_timeout)
-    local_timeout = timeout + REMOTE_TIMEOUT_MARGIN if CLAB_HOST else timeout
-    proc = _run_argv(argv, local_timeout, f"clab コマンド: {' '.join(args)}")
+    proc = _run_host_command(
+        _clab_argv(args, timeout=timeout), timeout, f"clab コマンド: {' '.join(args)}"
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"clab コマンド失敗 (rc={proc.returncode}): {' '.join(args)}\n"
             f"stderr:\n{proc.stderr.strip()}\nstdout:\n{proc.stdout.strip()}"
         )
     return proc
+
+
+def _run_host_command(
+    argv: list[str], timeout: int, label: str
+) -> subprocess.CompletedProcess:
+    """構築済みホストコマンドに、リモート側 timeout 回収用の猶予を適用する。"""
+    local_timeout = timeout + REMOTE_TIMEOUT_MARGIN if CLAB_HOST else timeout
+    return _run_argv(argv, local_timeout, label)
 
 
 def _normalize_inspect_json(raw: Any) -> list[dict[str, Any]]:
@@ -379,13 +389,20 @@ def _inspect_via_api(lab_name: str) -> list[dict[str, Any]]:
 # =============================================================================
 
 def _load_topo_yaml(topo_path: str) -> dict[str, Any]:
-    if not os.path.isfile(topo_path):
-        raise RuntimeError(f"トポロジファイルが見つかりません: {topo_path}")
-    with open(topo_path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+    data = _load_yaml(topo_path)
     if not isinstance(data, dict):
         raise RuntimeError(f"トポロジ YAML の内容が不正です: {topo_path}")
+    _topo_nodes_and_links(data)
     return data
+
+
+def _load_yaml(path: str) -> Any:
+    """YAML の読み込み失敗を、呼び出し側が扱える RuntimeError に統一する。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"YAML の読み込みに失敗: {path} ({exc})") from exc
 
 
 def _find_topo_for_lab(lab_name: str) -> Optional[str]:
@@ -412,8 +429,22 @@ def _find_topo_for_lab(lab_name: str) -> Optional[str]:
 
 def _topo_nodes_and_links(topo: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
     topology = topo.get("topology", {}) or {}
+    if not isinstance(topology, dict):
+        raise RuntimeError("トポロジの topology はマッピングで指定してください")
     nodes = topology.get("nodes", {}) or {}
     links = topology.get("links", []) or []
+    if not isinstance(nodes, dict) or any(
+        not isinstance(name, str) or not isinstance(node, (dict, type(None)))
+        for name, node in nodes.items()
+    ):
+        raise RuntimeError("トポロジの nodes はノード名とマッピングで指定してください")
+    if not isinstance(links, list):
+        raise RuntimeError("トポロジの links はリストで指定してください")
+    for node in nodes.values():
+        if node and node.get("startup-config") is not None and not isinstance(
+            node["startup-config"], str
+        ):
+            raise RuntimeError("startup-config はパス文字列で指定してください")
     return nodes, links
 
 
@@ -426,7 +457,7 @@ def _safe_join(base_dir: str, *parts: str) -> str:
     """
     base_abs = os.path.realpath(base_dir or ".")
     target_abs = os.path.realpath(os.path.join(base_abs, *parts))
-    if target_abs != base_abs and not target_abs.startswith(base_abs + os.sep):
+    if os.path.commonpath([base_abs, target_abs]) != base_abs:
         raise ValueError(
             f"許可されたディレクトリ外へのパスです: {os.path.join(*parts)!r} (base={base_dir})"
         )
@@ -510,11 +541,11 @@ def _credentials_for(kind: str) -> tuple[str, str]:
 
 
 def _build_host(node: dict[str, Any]) -> Optional[tuple[str, Host]]:
-    """正規化ノード dict から Nornir Host を生成する。mgmt_ip 無しは None。"""
+    """正規化ノード dict から Host を生成する。SSH ノードには mgmt_ip が必要。"""
     name = node["name"]
     kind = node.get("kind", "linux")
     mgmt_ip = node.get("mgmt_ip")
-    if not mgmt_ip:
+    if not mgmt_ip and kind != "linux":
         return None
 
     device_type = _netmiko_device_type(kind)
@@ -605,12 +636,18 @@ def _docker_exec_argv(
     container: str, command: str, timeout: Optional[int] = None
 ) -> list[str]:
     """linux kind ノードへの docker exec 呼び出し argv を組み立てる。"""
-    local = []
-    if CLAB_SUDO:
-        local.append("sudo")
-        local.append("-n")
-    local += ["docker", "exec", container, "sh", "-c", command]
-    return _remote_argv(local, timeout=timeout)
+    return _host_argv(["docker", "exec", container, "sh", "-c", command], timeout=timeout)
+
+
+class _DockerExecError(RuntimeError):
+    """docker exec の終了コードを保持し、取得対象外と実行失敗を区別する。"""
+
+    def __init__(self, proc: subprocess.CompletedProcess) -> None:
+        self.returncode = proc.returncode
+        super().__init__(
+            f"docker exec 失敗 (rc={proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
 
 
 def _run_docker_exec(container: str, command: str, timeout: int) -> str:
@@ -621,15 +658,12 @@ def _run_docker_exec(container: str, command: str, timeout: int) -> str:
     scripts/clab-cli と同じ方式）。``CLAB_HOST`` 設定時は ssh 経由でリモートの
     containerlab ホスト上で docker exec を実行する。
     """
-    remote_timeout = timeout if CLAB_HOST else None
-    argv = _docker_exec_argv(container, command, timeout=remote_timeout)
-    local_timeout = timeout + REMOTE_TIMEOUT_MARGIN if CLAB_HOST else timeout
-    proc = _run_argv(argv, local_timeout, f"docker exec ({container})")
+    proc = _run_host_command(
+        _docker_exec_argv(container, command, timeout=timeout), timeout,
+        f"docker exec ({container})",
+    )
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"docker exec 失敗 (rc={proc.returncode}): "
-            f"{proc.stderr.strip() or proc.stdout.strip()}"
-        )
+        raise _DockerExecError(proc)
     return proc.stdout
 
 
@@ -704,7 +738,9 @@ def _collect_config_task(task: Task) -> Result:
             config_text = _run_docker_exec(
                 container, LINUX_CONFIG_COMMAND, NETMIKO_READ_TIMEOUT
             )
-        except RuntimeError:
+        except _DockerExecError as exc:
+            if exc.returncode != 127:
+                raise
             # vtysh が無い（FRR 以外の）linux コンテナは取得対象外扱いにする
             return Result(
                 host=task.host,
@@ -803,12 +839,23 @@ def _discover_test_files(path: str) -> list[str]:
 
 def _load_test_cases(test_file: str) -> tuple[Optional[str], list[dict[str, Any]]]:
     """test.yml をロードし (lab_name, cases) を返す。"""
-    with open(test_file, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+    data = _load_yaml(test_file)
+    cases: Any
+    if data is None:
+        data = {}
     if isinstance(data, list):
-        return None, data
-    lab_name = data.get("lab") or data.get("lab_name")
-    cases = data.get("tests") or data.get("cases") or []
+        lab_name, cases = None, data
+    elif isinstance(data, dict):
+        lab_name = data.get("lab") or data.get("lab_name")
+        cases = data.get("tests", data.get("cases", []))
+    else:
+        raise RuntimeError(f"テスト YAML はマッピングまたはリストで指定してください: {test_file}")
+    if lab_name is not None and not isinstance(lab_name, str):
+        raise RuntimeError(f"lab は文字列で指定してください: {test_file}")
+    if cases is None:
+        cases = []
+    if not isinstance(cases, list) or any(not isinstance(case, dict) for case in cases):
+        raise RuntimeError(f"tests はテストケースのマッピングのリストで指定してください: {test_file}")
     return lab_name, cases
 
 
@@ -831,7 +878,7 @@ def _evaluate_assertion(output: str, assertion: dict[str, Any]) -> tuple[bool, s
 
     if "exit_code" in assertion:
         expected = int(assertion["exit_code"])
-        match = re.search(r"__RC__=(\d+)", output)
+        match = re.search(r"(?:^|\n)__RC__=(\d+)\s*\Z", output)
         if not match:
             # __RC__ マーカーの付与は linux kind のみ（_run_test_case 参照）。
             # マーカーが無い場合に actual=0 とみなすと、コマンド自体が失敗
@@ -848,6 +895,10 @@ def _evaluate_assertion(output: str, assertion: dict[str, Any]) -> tuple[bool, s
     return False, "アサーション条件がありません (contains/regex/exit_code)"
 
 
+def _test_failure(name: str, node: str, detail: str) -> dict[str, Any]:
+    return {"test": name, "node": node, "passed": False, "detail": detail}
+
+
 def _run_test_case(
     lab_name: str, case: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -858,12 +909,16 @@ def _run_test_case(
     assertion = case.get("assert") or {}
 
     if not command_or_alias:
-        return [{"test": name, "node": "-", "passed": False, "detail": "command 未指定"}]
+        return [_test_failure(name, "-", "command 未指定")]
+    if not isinstance(command_or_alias, str) or not isinstance(assertion, dict):
+        return [_test_failure(name, "-", "command は文字列、assert はマッピングで指定してください")]
+    if node_filter is not None and not isinstance(node_filter, str):
+        return [_test_failure(name, "-", "nodes はノード名または正規表現の文字列で指定してください")]
 
     try:
         nodes = _inspect_nodes(lab_name)
     except RuntimeError as exc:
-        return [{"test": name, "node": "-", "passed": False, "detail": str(exc)}]
+        return [_test_failure(name, "-", str(exc))]
 
     # exit_code 判定がある場合は linux コマンドに RC 収集を付与
     wants_exit_code = "exit_code" in assertion
@@ -871,24 +926,25 @@ def _run_test_case(
     def _test_task(task: Task) -> Result:
         kind = task.host.data.get("kind", "linux")
         command = resolve_command(command_or_alias, kind)
-        if wants_exit_code and kind == "linux":
-            command = f"{command}; echo __RC__=$?"
+        if wants_exit_code:
+            if kind != "linux":
+                raise RuntimeError("exit_code アサーションは linux kind のみサポートしています")
+            # 別シェルに閉じ込め、exit や末尾コメントでも RC 収集を実行する。
+            command = f"sh -c {shlex.quote(command)}; printf '\\n__RC__=%s\\n' \"$?\""
         output = _dispatch_command(task, kind, command, use_textfsm=False)
         return Result(host=task.host, result=output)
 
     try:
         nr = _build_nornir(nodes, node_filter_regex=node_filter)
     except RuntimeError as exc:
-        return [{"test": name, "node": node_filter or "*", "passed": False, "detail": str(exc)}]
+        return [_test_failure(name, node_filter or "*", str(exc))]
 
     results = _run_nornir(nr, _test_task)
 
     outcomes: list[dict[str, Any]] = []
     for host_name, res in results.items():
         if res["failed"]:
-            outcomes.append(
-                {"test": name, "node": host_name, "passed": False, "detail": res["error"]}
-            )
+            outcomes.append(_test_failure(name, host_name, res["error"]))
             continue
         ok, detail = _evaluate_assertion(str(res["result"]), assertion)
         outcomes.append(
@@ -1244,31 +1300,29 @@ def snapshot_and_save_configs(
     if mode not in ("snapshot", "startup"):
         return f"[snapshot_and_save_configs] エラー: 不正な mode '{mode}' (snapshot|startup)"
 
+    topo = None
+    base_dir = "."
+    target_dir = ""
     try:
+        if mode == "startup":
+            topo_path = _find_topo_for_lab(lab_name)
+            if not topo_path:
+                return "[snapshot_and_save_configs] エラー: startup モードにはトポロジ YAML が必要です"
+            topo = _load_topo_yaml(topo_path)
+            base_dir = os.path.dirname(os.path.abspath(topo_path)) or "."
         nodes = _inspect_nodes(lab_name)
         nr = _build_nornir(nodes)
         results = _run_nornir(nr, _collect_config_task)
+        if mode == "snapshot":
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            target_dir = tempfile.mkdtemp(prefix=f"save-{timestamp}-", dir=save_dir)
     except Exception as exc:  # noqa: BLE001
         return f"[snapshot_and_save_configs] エラー: {exc}"
-
-    topo = None
-    base_dir = "."
-    if mode == "startup":
-        topo_path = _find_topo_for_lab(lab_name)
-        if not topo_path:
-            return "[snapshot_and_save_configs] エラー: startup モードにはトポロジ YAML が必要です"
-        topo = _load_topo_yaml(topo_path)
-        base_dir = os.path.dirname(os.path.abspath(topo_path)) or "."
 
     saved: list[str] = []
     skipped: list[str] = []
     errors: list[str] = []
-
-    target_dir = ""
-    if mode == "snapshot":
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target_dir = os.path.join(save_dir, f"save-{timestamp}")
-        os.makedirs(target_dir, exist_ok=True)
 
     for host_name, res in results.items():
         if res["failed"]:
@@ -1329,24 +1383,11 @@ def restore_startup_configs(
     """
     try:
         topo = _load_topo_yaml(topo_path)
-    except RuntimeError as exc:
+        snapshot_dir = _resolve_snapshot_dir(save_dir, snapshot_name)
+    except (RuntimeError, ValueError) as exc:
         return f"[restore_startup_configs] エラー: {exc}"
 
     base_dir = os.path.dirname(os.path.abspath(topo_path)) or "."
-
-    # スナップショットディレクトリを解決（save_dir 配下に限定する）
-    if snapshot_name == "latest":
-        candidates = sorted(glob.glob(os.path.join(save_dir, "save-*")))
-        if not candidates:
-            return f"[restore_startup_configs] エラー: スナップショットが見つかりません ({save_dir})"
-        snapshot_dir = candidates[-1]
-    else:
-        try:
-            snapshot_dir = _safe_join(save_dir, snapshot_name)
-        except ValueError as exc:
-            return f"[restore_startup_configs] エラー: {exc}"
-        if not os.path.isdir(snapshot_dir):
-            return f"[restore_startup_configs] エラー: スナップショットが存在しません: {snapshot_dir}"
 
     nodes, _ = _topo_nodes_and_links(topo)
     restored: list[str] = []
@@ -1380,6 +1421,22 @@ def restore_startup_configs(
         summary.append(f"エラー: {len(errors)} 件")
         summary += [f"  - {e}" for e in errors]
     return "\n".join(summary)
+
+
+def _resolve_snapshot_dir(save_dir: str, snapshot_name: str) -> str:
+    """latest と明示名の両方で、復元元を save_dir 配下のディレクトリに限定する。"""
+    if snapshot_name == "latest":
+        candidates = sorted(
+            path for path in glob.glob(os.path.join(glob.escape(save_dir), "save-*"))
+            if os.path.isdir(path)
+        )
+        if not candidates:
+            raise RuntimeError(f"スナップショットが見つかりません ({save_dir})")
+        snapshot_name = os.path.basename(candidates[-1])
+    snapshot_dir = _safe_join(save_dir, snapshot_name)
+    if not os.path.isdir(snapshot_dir):
+        raise RuntimeError(f"スナップショットが存在しません: {snapshot_dir}")
+    return snapshot_dir
 
 
 @mcp.tool()
@@ -1419,9 +1476,11 @@ def run_topology_tests(test_file_or_dir: str) -> str:
             lab_name, cases = _load_test_cases(test_file)
         except Exception as exc:  # noqa: BLE001
             report_lines.append(f"  ロード失敗: {exc}")
+            all_outcomes.append(_test_failure(test_file, "-", str(exc)))
             continue
         if not lab_name:
-            report_lines.append("  スキップ: lab / lab_name が未指定です")
+            report_lines.append("  ロード失敗: lab / lab_name が未指定です")
+            all_outcomes.append(_test_failure(test_file, "-", "lab / lab_name が未指定です"))
             continue
 
         for case in cases:
@@ -1430,14 +1489,7 @@ def run_topology_tests(test_file_or_dir: str) -> str:
             except Exception as exc:  # noqa: BLE001 - 1ケースの異常でバッチ全体を落とさない
                 case_name = case.get("name", "unnamed")
                 logger.exception("test case %r raised unexpectedly", case_name)
-                outcomes = [
-                    {
-                        "test": case_name,
-                        "node": "-",
-                        "passed": False,
-                        "detail": f"想定外エラー: {exc}",
-                    }
-                ]
+                outcomes = [_test_failure(case_name, "-", f"想定外エラー: {exc}")]
             all_outcomes.extend(outcomes)
             for o in outcomes:
                 status = "PASS" if o["passed"] else "FAIL"
@@ -1490,6 +1542,19 @@ def _find_wireshark() -> Optional[str]:
     return None
 
 
+def _stop_capture_process(proc: subprocess.Popen) -> None:
+    """キャプチャプロセスを終了し、終了待ちでプロセスを回収する。"""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    else:
+        proc.wait()
+
+
 @mcp.tool()
 def trigger_packet_capture(
     remote_host: str, container_name: str, interface_name: str
@@ -1521,7 +1586,7 @@ def trigger_packet_capture(
         ("container_name", container_name),
         ("interface_name", interface_name),
     ):
-        if not value or not token.match(value):
+        if not value or value.startswith("-") or not token.fullmatch(value):
             return f"[trigger_packet_capture] エラー: 不正な {label}: {value!r}"
 
     wireshark = _find_wireshark()
@@ -1553,6 +1618,7 @@ def trigger_packet_capture(
         remote_capture,
     ]
 
+    ssh_proc: Optional[subprocess.Popen] = None
     try:
         ssh_proc = subprocess.Popen(
             ssh_cmd,
@@ -1569,6 +1635,8 @@ def trigger_packet_capture(
         if ssh_proc.stdout:
             ssh_proc.stdout.close()  # SIGPIPE を Wireshark 側へ伝播させる
 
+        capture_proc = ssh_proc
+
         def _wait_and_cleanup() -> None:
             """Wireshark 終了後、ssh（延いてはリモート tshark）を確実に終了させる。
 
@@ -1577,21 +1645,19 @@ def trigger_packet_capture(
             terminate/kill する。ssh の切断により sshd がリモートプロセスへ
             SIGHUP を送るため、リモート側の tshark ゾンビ化も防げる。
             """
-            ws_proc.wait()
-            if ssh_proc.poll() is None:
-                ssh_proc.terminate()
-                try:
-                    ssh_proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    ssh_proc.kill()
-                    ssh_proc.wait()
-            else:
-                ssh_proc.wait()
+            try:
+                ws_proc.wait()
+            finally:
+                _stop_capture_process(capture_proc)
 
         threading.Thread(target=_wait_and_cleanup, daemon=True).start()
-    except FileNotFoundError as exc:
-        return f"[trigger_packet_capture] エラー: 実行バイナリが見つかりません: {exc}"
     except Exception as exc:  # noqa: BLE001
+        if ssh_proc is not None:
+            if ssh_proc.stdout:
+                ssh_proc.stdout.close()
+            _stop_capture_process(ssh_proc)
+        if isinstance(exc, FileNotFoundError):
+            return f"[trigger_packet_capture] エラー: 実行バイナリが見つかりません: {exc}"
         return f"[trigger_packet_capture] エラー: {exc}"
 
     return (

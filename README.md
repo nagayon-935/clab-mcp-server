@@ -165,6 +165,7 @@ run_parallel_command(lab_name="mylab", command_or_alias="show version", node_fil
   "<command>"` instead — the same approach as `scripts/clab-exec-all` /
   `scripts/clab-cli`. When `CLAB_HOST` is set, `docker exec` runs over ssh on
   that remote host (not locally), since Docker itself only exists there.
+  Linux nodes remain available even when they have no management IP.
 - **All other kinds** (`cisco_xrd`, `arista_ceos`, `juniper_crpd`, etc.): sent
   via Netmiko/SSH to the node's mgmt IP, as described above.
 
@@ -188,12 +189,11 @@ tests:
 If `test_file_or_dir` points to a directory, all `test.yml` /
 `test.yaml` files under it are discovered recursively and executed.
 
-**`exit_code` assertions only work on `kind: linux` nodes.** The test
-engine appends `; echo __RC__=$?` to the command on `linux`-kind nodes
-to capture the shell exit status; other kinds (Cisco/Arista/Juniper
-etc.) have no equivalent mechanism, so an `exit_code` assertion against
-them always fails with a "no `__RC__` marker" detail rather than being
-silently treated as success.
+**`exit_code` assertions only work on `kind: linux` nodes.** Commands run
+in a child shell so that `exit` and trailing comments cannot prevent
+exit-status collection. Other kinds (Cisco/Arista/Juniper etc.) report
+an unsupported-assertion failure before executing the command.
+Invalid test files and missing lab names count as failures in the summary.
 
 ### Topology YAML Auto-Discovery
 
@@ -211,7 +211,7 @@ above) the relevant topology YAML.
 
 ```text
 save/
-  save-20260703-021500/
+  save-20260703-021500-123456-abcdefgh/
     r1.conf
     r2.conf
 startup-configs/
@@ -222,6 +222,11 @@ startup-configs/
 (FRR) nodes via `docker exec ... vtysh -c 'show running-config'`; plain
 linux containers without `vtysh` (e.g. an L2-switch role container) are
 skipped, same as kinds absent from `KIND_COMMAND`.
+Connection failures and timeouts are reported as errors. Snapshot directories
+include microseconds and a unique suffix to keep concurrent saves separate.
+Existing `save-<timestamp>` directories can still be restored. Both explicit
+snapshot names and `latest` must resolve to a directory inside `save_dir`;
+symlinks pointing outside it are rejected.
 
 **Local filesystem note:** unlike `deploy_lab`/`destroy_lab`/etc., the
 file I/O in `snapshot_and_save_configs` and `restore_startup_configs`
