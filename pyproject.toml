@@ -1,6 +1,6 @@
 [project]
 name = "clab-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Containerlab x Nornir/Netmiko ハイブリッド型 MCP サーバー"
 requires-python = ">=3.10"
 dependencies = [

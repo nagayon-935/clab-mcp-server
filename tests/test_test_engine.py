@@ -155,14 +155,14 @@ def test_invalid_test_file_prevents_all_pass_verdict(tmp_path, monkeypatch, bad_
         {"test": "valid", "node": "r1", "passed": True, "detail": "OK"}
     ])
     report = server.run_topology_tests(str(tmp_path))
-    assert "FAILURES" in report
-    assert "PASS: 1  FAIL: 1" in report
-    assert "ALL PASS" not in report
+    assert report["data"]["verdict"] == "FAILURES"
+    assert report["counts"]["succeeded"] == report["counts"]["failed"] == 1
+    assert report["status"] == "partial"
 
 
 @pytest.mark.parametrize("case", [
     {"command": 42}, {"command": "uptime", "assert": "bad"},
-    {"command": "uptime", "nodes": ["r1"]},
+    {"command": "uptime", "nodes": 42},
 ])
 def test_invalid_case_fields_fail_before_inspection(monkeypatch, case):
     def unexpected_inspect(lab):

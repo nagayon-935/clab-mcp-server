@@ -23,7 +23,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY server.py tool_results.py .
 
 RUN useradd --create-home --uid 1000 mcp \
     && mkdir -p /workspace \

@@ -4,7 +4,7 @@ import server
 
 
 def _mock_config_collection(monkeypatch, config="hostname r1"):
-    monkeypatch.setattr(server, "_inspect_nodes", lambda lab: [])
+    monkeypatch.setattr(server, "_inspect_nodes", lambda lab: [{"name": "r1", "kind": "linux"}])
     monkeypatch.setattr(server, "_build_nornir", lambda nodes: object())
     monkeypatch.setattr(server, "_run_nornir", lambda nr, task: {
         "r1": {"failed": False, "result": config}
@@ -24,8 +24,8 @@ def test_snapshot_calls_at_same_time_preserve_both_configs(tmp_path, monkeypatch
     _mock_config_collection(monkeypatch, "second config")
     second = server.snapshot_and_save_configs("x", save_dir=str(save_dir))
 
-    assert "保存成功: 1" in first
-    assert "保存成功: 1" in second
+    assert first["counts"]["succeeded"] == 1
+    assert second["counts"]["succeeded"] == 1
     assert {path.read_text() for path in save_dir.glob("save-*/r1.conf")} == {
         "first config\n", "second config\n"
     }
@@ -36,7 +36,7 @@ def test_snapshot_directory_creation_failure_returns_error(tmp_path, monkeypatch
     save_dir = tmp_path / "file"
     save_dir.write_text("file", encoding="utf-8")
     result = server.snapshot_and_save_configs("x", save_dir=str(save_dir))
-    assert "エラー" in result
+    assert result["status"] == "error"
     assert save_dir.read_text() == "file"
 
 
@@ -47,7 +47,7 @@ def test_startup_snapshot_validates_topology_before_collecting_configs(tmp_path,
         raise AssertionError("topology validation must precede config collection")
 
     monkeypatch.setattr(server, "_inspect_nodes", unexpected_inspection)
-    assert "トポロジ YAML が必要" in server.snapshot_and_save_configs("x", mode="startup")
+    assert "トポロジ YAML が必要" in server.snapshot_and_save_configs("x", mode="startup")["errors"][0]["message"]
 
 
 def test_latest_snapshot_ignores_files(tmp_path):
@@ -68,7 +68,7 @@ def test_latest_snapshot_rejects_symlink_outside_save_dir(tmp_path):
     topo_path.write_text("name: x\ntopology: {nodes: {r1: {}}}", encoding="utf-8")
 
     result = server.restore_startup_configs(str(topo_path), save_dir=str(save_dir))
-    assert "エラー" in result
+    assert result["status"] == "error"
     assert not (tmp_path / "startup-configs").exists()
 
 
