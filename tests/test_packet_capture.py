@@ -15,7 +15,7 @@ def test_capture_rejects_options_and_newlines_before_launch(monkeypatch, field, 
     monkeypatch.setattr(server.subprocess, "Popen", launch)
     kwargs = {"remote_host": "host", "container_name": "clab-x-r1", "interface_name": "eth1"}
     kwargs[field] = value
-    assert "エラー" in server.trigger_packet_capture(**kwargs)
+    assert server.trigger_packet_capture(**kwargs)["status"] == "error"
     launch.assert_not_called()
 
 
@@ -28,7 +28,7 @@ def test_capture_cleans_up_ssh_if_wireshark_launch_fails(monkeypatch, error):
     monkeypatch.setattr(server.subprocess, "Popen", launch)
 
     result = server.trigger_packet_capture("host", "clab-x-r1", "eth1")
-    assert "エラー" in result
+    assert result["status"] == "error"
     ssh.stdout.close.assert_called_once()
     ssh.terminate.assert_called_once()
     ssh.wait.assert_called_once_with(timeout=5)

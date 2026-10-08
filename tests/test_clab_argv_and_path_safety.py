@@ -130,7 +130,7 @@ def test_restore_startup_configs_rejects_snapshot_name_traversal(tmp_path, monke
         topo_path=str(topo_path), snapshot_name="../../../etc", save_dir="save"
     )
 
-    assert "エラー" in result
+    assert result["status"] == "error"
 
 
 def test_restore_startup_configs_rejects_startup_config_outside_base_dir(
@@ -157,7 +157,7 @@ def test_restore_startup_configs_rejects_startup_config_outside_base_dir(
         save_dir=str(labdir / "save"),
     )
 
-    assert "エラー" in result
+    assert result["status"] == "error"
     assert not outside_target.exists()
 
 
@@ -180,5 +180,5 @@ def test_restore_startup_configs_writes_dest_for_valid_relative_path(
         topo_path=str(topo_path), snapshot_name="save-20260101-000000", save_dir="save"
     )
 
-    assert "復元成功: 1" in result
+    assert result["counts"]["succeeded"] == 1
     assert (tmp_path / "configs" / "r1.cfg").read_text() == "hostname r1\n"

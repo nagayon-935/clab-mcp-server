@@ -1,4 +1,6 @@
 import pytest
+import json
+from types import SimpleNamespace
 
 import server
 
@@ -54,3 +56,22 @@ def test_build_nornir_converts_bad_regex_to_runtime_error():
 def test_build_nornir_worker_count_capped_by_host_count():
     nr = server._build_nornir(NODES, node_filter_regex="^r")
     assert nr.runner.num_workers == 2
+
+
+def test_live_label_lookup_uses_host_argv_and_extracts_only_labels(monkeypatch):
+    monkeypatch.setattr(server, "CLAB_HOST", "remote")
+    monkeypatch.setattr(server, "CLAB_SUDO", True)
+    captured = []
+
+    def run(argv, timeout, label):
+        captured.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "Name": "/clab-x-r1", "Labels": {"role": "leaf"}
+        }) + "\n", stderr="")
+
+    monkeypatch.setattr(server, "_run_argv", run)
+    result = server._inspect_node_labels([NODES[0]])
+    assert result == {"clab-x-r1": {"role": "leaf"}}
+    assert captured[0][0] == "ssh"
+    assert "sudo -n docker inspect --format" in captured[0][-1]
+    assert "Config.Labels" in captured[0][-1]

@@ -126,18 +126,84 @@ default credentials.
 
 | Tool | Summary |
 |---|---|
+| `list_labs()` | Discover deployed labs, their state, node count, and host-side topology path |
+| `list_topologies(search_dir=".")` | Discover local topology YAML files, including undeployed labs |
+| `diagnose_environment(lab_name=None, check_node_connections=False)` | Check host SSH, clab, Docker, search location, and discovery independently; optionally check node connections and authentication |
 | `deploy_lab(topo_yaml_path, reconfigure=False)` | Deploy a new lab from a topology YAML file (`reconfigure=True` adds `--reconfigure`, regenerating config artifacts) |
 | `apply_lab(topo_yaml_path, dry_run=False)` | Reconcile a running lab with the topology YAML (containerlab 0.77+ `apply`): deploys if the lab doesn't exist yet, otherwise only adds/removes the changed nodes/links instead of recreating everything. `dry_run=True` previews changes without applying them. Requires containerlab >= 0.77. |
 | `destroy_lab(topo_yaml_path, cleanup=False)` | Destroy a lab from a topology YAML file (`cleanup=True` adds `--cleanup`, deleting the lab directory entirely) |
 | `redeploy_lab(topo_yaml_path, cleanup=False)` | Destroy and redeploy a lab in one call (`clab redeploy`); `cleanup=True` adds `--cleanup` |
 | `restart_lab_nodes(lab_name, node_names=None)` | Restart one, several, or all nodes in a running lab without recreating containers (`clab restart`, seamless dataplane). Omit `node_names` to restart every node. |
 | `inspect_lab_topology(lab_name)` | Get running nodes' mgmt IP, kind, and link info |
-| `run_parallel_command(lab_name, command_or_alias, node_filter_regex=None)` | Run a command on all (or regex-filtered) nodes fully in parallel |
-| `run_node_command(lab_name, node_name, command=None)` | Run a command on exactly one node (the non-interactive equivalent of `scripts/clab-cli`), reporting the connection method and destination used. Useful for isolating per-node connectivity/auth failures that get lost in a parallel run. `command` defaults to the `interfaces` alias when omitted. |
-| `snapshot_and_save_configs(lab_name, mode="snapshot", save_dir="save", default_startup_dir="startup-configs")` | Collect configs from all nodes in parallel; save as a snapshot or write directly to startup-config |
+| `run_parallel_command(lab_name, command_or_alias, node_filter_regex=None, node_names=None, node_labels=None, max_output_chars=5000)` | Run parallel commands using exact node names, labels, or a regex |
+| `run_node_command(lab_name, node_name, command=None, max_output_chars=5000)` | Run on one exact node; report connection method, destination, output, and failure cause. Default command: `interfaces` |
+| `read_command_output(output_id, offset=0, max_output_chars=5000)` | Read another page of saved output without executing the command again |
+| `snapshot_and_save_configs(lab_name, mode="snapshot", save_dir="save", default_startup_dir="startup-configs", node_names=None, node_labels=None)` | Collect configs from all or selected nodes; save as a snapshot or write startup-config files |
 | `restore_startup_configs(topo_path, snapshot_name="latest", save_dir="save")` | Restore a saved snapshot to each node's startup-config path |
 | `run_topology_tests(test_file_or_dir)` | Recursively discover `test.yml` files and produce a PASS/FAIL report |
 | `trigger_packet_capture(remote_host, container_name, interface_name)` | Stream a remote `tshark` capture into local Wireshark |
+
+### Discover and Operate a Lab
+
+Ask the AI to "show deployed labs" or "check r1 and r2 in mylab". Example tool calls:
+
+```text
+list_labs()
+list_topologies(search_dir="/path/to/labs")
+inspect_lab_topology(lab_name="mylab")
+run_parallel_command(lab_name="mylab", command_or_alias="interfaces", node_names=["r1", "r2"])
+run_parallel_command(lab_name="mylab", command_or_alias="bgp-summary", node_labels={"role": "leaf"})
+diagnose_environment()
+diagnose_environment(lab_name="mylab", check_node_connections=True)
+```
+
+`node_names` matches exactly: `r1` does not select `r10`. An empty list or unknown
+name fails before command execution. It cannot be combined with `node_filter_regex`.
+`node_labels` requires all supplied key/value pairs to match and can be combined
+with exact names. Missing inspect labels are fetched from Docker on the lab host.
+If that lookup fails, they are supplemented from a matching local
+topology's defaults, kinds, groups, and node definitions, with a warning. Keep that
+YAML consistent with the deployed lab.
+
+Diagnosis does not change configurations. Node checks require explicit opt-in:
+Linux uses `docker exec ... true`; other kinds connect and authenticate through
+Netmiko/SSH. Failed host SSH causes dependent checks to be marked unperformed.
+`list_labs` reports paths on the lab host; `list_topologies` reports paths on the
+MCP server. Those locations can differ when operating remotely.
+
+### Common Results and Migration to 0.2
+
+**Version 0.2 changes every tool's return value to a structured object.** Clients
+that parsed prose or JSON strings should use `status` and `data`. Previous top-level
+`nodes`, `links`, and command `results` fields now live under `data`.
+
+```json
+{
+  "tool": "run_parallel_command",
+  "status": "partial",
+  "summary": "3台中1台で成功、1台で失敗、1台をスキップしました。",
+  "counts": {"total": 3, "succeeded": 1, "failed": 1, "skipped": 1},
+  "data": {"lab": "mylab", "results": {}},
+  "warnings": [],
+  "errors": [{"code": "AUTHENTICATION_FAILED", "message": "Authentication failed", "node": "r2", "next_step": "Check SSH keys and device credentials."}],
+  "next_steps": ["Check SSH keys and device credentials."]
+}
+```
+
+`status` is `success`, `partial`, `error`, or `skipped`. Counts refer to labs,
+files, nodes, test outcomes, or diagnostic checks, depending on the tool.
+Each entry in `data.results` includes its status, connection details, output,
+failure cause, or skip reason. Available results are preserved when other nodes fail.
+
+Command output defaults to 5000 characters per node. `max_output_chars` accepts
+1–100000. Truncated output includes `output_info.truncated`, the character count,
+`output_id`, and `next_offset`. Pass the ID and offset to `read_command_output`
+to continue without rerunning the command. Truncated structured output is a JSON
+text fragment. Truncation does not indicate execution failure.
+Output is retained within the same process for up to one hour, 100 entries,
+and one million characters per entry. Restart, expiration, or eviction invalidates
+handles. Larger output is not retained and includes `unavailable_reason`.
+Lab inventory is still discovered fresh on each operation.
 
 ### Command Aliases for run_parallel_command
 
@@ -180,7 +246,7 @@ parallel-run summary.
 lab: mylab
 tests:
   - name: "BGP established on r1"
-    nodes: "r1"              # node short name or regex
+    nodes: ["r1", "r2"]      # exact names; a string retains the legacy regex behavior
     command: "bgp-summary"   # alias or literal command
     assert:
       contains: "Established"   # or regex / exit_code
@@ -206,6 +272,8 @@ explicitly (an empty `links` list with a warning, or an error for
 `mode="startup"`) rather than guessing and falling back to an unrelated
 topology file — run the MCP server from a directory containing (or
 above) the relevant topology YAML.
+Multiple matching files produce a warning for link discovery and an error for
+startup saves. Use `list_topologies` to inspect the candidates.
 
 ### Snapshot / Restore Directory Layout
 
@@ -236,8 +304,7 @@ go through `CLAB_HOST` over ssh. When running against a remote
 containerlab host, make sure `save_dir`/the topology's directory is
 reachable at the same local path (e.g. mount or sync the remote lab
 directory) or these two tools won't line up with the actual lab.
-Both tools now prepend a `⚠` warning line to their result summary
-whenever `CLAB_HOST` is set, as a runtime reminder of this caveat.
+Both tools include this reminder in `warnings` whenever `CLAB_HOST` is set.
 
 ## Development
 

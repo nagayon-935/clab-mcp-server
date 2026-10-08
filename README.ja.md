@@ -123,18 +123,82 @@ stdio 起動なので、クライアント側の設定に `command`/`args` を�
 
 | ツール | 概要 |
 |---|---|
+| `list_labs()` | 稼働ホストのラボ一覧。名前・状態・ノード数・ホスト側トポロジパスを取得 |
+| `list_topologies(search_dir=".")` | MCPサーバー側のトポロジYAML一覧。未デプロイのファイルも探索 |
+| `diagnose_environment(lab_name=None, check_node_connections=False)` | ホストSSH、clab、Docker、探索場所、ラボ検出を個別に診断。指定時のみノード接続・認証も確認 |
 | `deploy_lab(topo_yaml_path, reconfigure=False)` | トポロジ YAML からラボを新規デプロイ(`reconfigure=True` で `--reconfigure` を付与し設定成果物を再生成) |
 | `apply_lab(topo_yaml_path, dry_run=False)` | トポロジ YAML と稼働中ラボの差分だけを反映(containerlab 0.77+ の `apply`)。未デプロイなら新規デプロイ、稼働中ならノード/リンクの追加・削除など変更部分のみ反映し、無関係なノードは再作成しない。`dry_run=True` で適用せず変更内容のみ表示。containerlab 0.77 以上が必要 |
 | `destroy_lab(topo_yaml_path, cleanup=False)` | トポロジ YAML からラボを破棄(`cleanup=True` で `--cleanup` を付与しラボディレクトリごと完全削除) |
 | `redeploy_lab(topo_yaml_path, cleanup=False)` | ラボを破棄してから同じトポロジで再デプロイ(`clab redeploy`)。`cleanup=True` で `--cleanup` を付与 |
 | `restart_lab_nodes(lab_name, node_names=None)` | 稼働中ラボのノードを1台・複数台・全台再起動(`clab restart`、コンテナ再作成無しのseamless dataplane)。`node_names` 省略で全ノード対象 |
 | `inspect_lab_topology(lab_name)` | 稼働中ノードの mgmt IP・kind・リンク情報を取得 |
-| `run_parallel_command(lab_name, command_or_alias, node_filter_regex=None)` | 全ノード（or 正規表現で絞込）に対しコマンドを完全並列実行 |
-| `run_node_command(lab_name, node_name, command=None)` | 1ノードだけに絞ってコマンドを実行（`scripts/clab-cli` の非対話版）。使用した接続方式・宛先を明示するので、並列実行では埋もれがちな個別ノードの疎通/認証失敗を切り分けられる。`command` 省略時は `interfaces` エイリアスを実行 |
-| `snapshot_and_save_configs(lab_name, mode="snapshot", save_dir="save", default_startup_dir="startup-configs")` | 全台の設定を並列回収してスナップショット保存 or startup-config へ直接反映 |
+| `run_parallel_command(lab_name, command_or_alias, node_filter_regex=None, node_names=None, node_labels=None, max_output_chars=5000)` | ノード名の完全一致、ラベル、または正規表現で絞り込み並列実行 |
+| `run_node_command(lab_name, node_name, command=None, max_output_chars=5000)` | 1ノードの接続方式・宛先・出力・失敗原因を取得。省略コマンドは `interfaces` |
+| `read_command_output(output_id, offset=0, max_output_chars=5000)` | 省略された出力の続きを取得。元のコマンドを再実行しない |
+| `snapshot_and_save_configs(lab_name, mode="snapshot", save_dir="save", default_startup_dir="startup-configs", node_names=None, node_labels=None)` | 全台または指定ノードの設定を回収してスナップショット保存 or startup-config へ書き込み |
 | `restore_startup_configs(topo_path, snapshot_name="latest", save_dir="save")` | 保存済みスナップショットを各ノードの startup-config パスへ復元 |
 | `run_topology_tests(test_file_or_dir)` | `test.yml` を再帰探索し PASS/FAIL レポートを生成 |
 | `trigger_packet_capture(remote_host, container_name, interface_name)` | リモートの `tshark` キャプチャをローカル Wireshark にストリーミング |
+
+### ラボを見つけて操作する
+
+会話では「動いているラボを見せて」「mylab の r1 と r2 の状態を確認して」
+と依頼できる。AIが呼び出すツールの例:
+
+```text
+list_labs()
+list_topologies(search_dir="/path/to/labs")
+inspect_lab_topology(lab_name="mylab")
+run_parallel_command(lab_name="mylab", command_or_alias="interfaces", node_names=["r1", "r2"])
+run_parallel_command(lab_name="mylab", command_or_alias="bgp-summary", node_labels={"role": "leaf"})
+diagnose_environment()
+diagnose_environment(lab_name="mylab", check_node_connections=True)
+```
+
+`node_names` は完全一致で、`r1` は `r10` に一致しない。空リストや存在しない
+名前は実行前にエラーとなる。従来の `node_filter_regex` と同時指定は不可。
+`node_labels` は指定した全キー・値の一致で選択し、名前指定とも組み合わせられる。
+inspectにラベルが無い場合はホストのDockerから取得する。それも取得できない場合は、
+一致するローカルYAMLのdefaults・kinds・groups・
+nodesから継承して補完し、`warnings` に明示する。稼働構成とYAMLの一致を確認すること。
+
+環境診断は設定変更を行わない。ノード接続確認は明示的に有効にした場合のみ行い、
+Linuxは `docker exec ... true`、他kindは管理IPへのSSH接続・認証を確認する。
+ホストへのSSHが失敗すると依存するチェックは未実施として表示する。
+`list_labs` のトポロジパスは稼働ホスト側、`list_topologies` のパスはMCPサーバー側。
+リモート構成では同じパスとは限らない。
+
+### 共通の結果形式と0.2への移行
+
+**0.2では全ツールの戻り値を構造化したオブジェクトへ変更した。** 従来の文章や
+JSON文字列を解析していたクライアントは、`status` と `data` を参照するよう変更する。
+以前の `inspect_lab_topology` の `nodes`・`links`、コマンドの `results` は `data` 配下になる。
+
+```json
+{
+  "tool": "run_parallel_command",
+  "status": "partial",
+  "summary": "3台中1台で成功、1台で失敗、1台をスキップしました。",
+  "counts": {"total": 3, "succeeded": 1, "failed": 1, "skipped": 1},
+  "data": {"lab": "mylab", "results": {}},
+  "warnings": [],
+  "errors": [{"code": "AUTHENTICATION_FAILED", "message": "認証に失敗しました", "node": "r2", "next_step": "SSH鍵・ユーザー名・機器の認証設定を確認してください。"}],
+  "next_steps": ["SSH鍵・ユーザー名・機器の認証設定を確認してください。"]
+}
+```
+
+`status` は `success` / `partial` / `error` / `skipped`。
+`counts` の単位はツールごとにラボ・ファイル・ノード・テスト結果・診断チェック。
+`data.results` の各ノードには状態、接続方式、出力、失敗原因またはスキップ理由が入る。
+接続失敗を含む場合も、取得できたノードの結果は返す。
+
+コマンド出力は各ノードにつき既定5000文字。`max_output_chars` は1〜100000で指定する。
+省略時には `output_info.truncated=true`、文字数、`output_id`、`next_offset` を返す。
+`read_command_output` にIDとオフセットを渡すと続きを取得できる。構造化出力を
+省略した場合はJSONのテキスト断片になる。出力の省略は操作の失敗を意味しない。
+保持は同一サーバープロセス内で最大1時間・100件・1件100万文字まで。
+再起動、期限切れ、件数上限による削除でIDは無効になる。上限を超える出力は
+保持せず `unavailable_reason` を返す。ラボのインベントリは引き続き毎回取得する。
 
 ### run_parallel_command のコマンドエイリアス
 
@@ -177,7 +241,7 @@ run_parallel_command(lab_name="mylab", command_or_alias="show version", node_fil
 lab: mylab
 tests:
   - name: "BGP established on r1"
-    nodes: "r1"              # ノード短名 or 正規表現
+    nodes: ["r1", "r2"]      # 完全一致。文字列を指定すると従来の正規表現
     command: "bgp-summary"   # エイリアス or リテラルコマンド
     assert:
       contains: "Established"   # または regex / exit_code
@@ -203,6 +267,8 @@ tests:
 警告を付与、または `mode="startup"` の場合はエラー）。該当のトポロジ
 YAML を含む（またはその上位の）ディレクトリから MCP サーバーを
 起動すること。
+同じラボ名のファイルが複数ある場合、リンク補完は警告、startup保存はエラーとなる。
+`list_topologies` で候補を確認できる。
 
 ### snapshot / restore のディレクトリ構成
 
@@ -233,8 +299,7 @@ startup-configs/
 ホストに対して使う場合は、`save_dir`/トポロジのディレクトリがローカルの
 同じパスから参照できるようにしておくこと(リモートのラボディレクトリを
 マウント/同期する等)。そうしないと実際のラボと噛み合わない。
-`CLAB_HOST` 設定時は、両ツールとも結果サマリの先頭に `⚠` 警告行を
-付与し、この注意点を実行時にも思い出せるようにしている。
+`CLAB_HOST` 設定時は、両ツールとも `warnings` にこの注意点を含める。
 
 ## 開発
 
