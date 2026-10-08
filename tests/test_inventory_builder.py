@@ -10,8 +10,15 @@ NODES = [
 ]
 
 
-def test_build_host_returns_none_when_no_mgmt_ip():
-    assert server._build_host({"name": "noip", "kind": "linux", "mgmt_ip": None}) is None
+def test_build_host_returns_none_when_ssh_node_has_no_mgmt_ip():
+    assert server._build_host({"name": "noip", "kind": "arista_ceos", "mgmt_ip": None}) is None
+
+
+def test_build_host_keeps_linux_node_without_mgmt_ip():
+    name, host = server._build_host(NODES[-1])
+    assert name == "noip"
+    assert host.hostname is None
+    assert host.data["container"] == "clab-x-noip"
 
 
 def test_build_host_sets_platform_and_data_from_kind():
@@ -23,9 +30,9 @@ def test_build_host_sets_platform_and_data_from_kind():
     assert host.data["container"] == "clab-x-r1"
 
 
-def test_build_nornir_skips_hosts_without_mgmt_ip():
+def test_build_nornir_includes_linux_hosts_without_mgmt_ip():
     nr = server._build_nornir(NODES)
-    assert set(nr.inventory.hosts.keys()) == {"r1", "r2", "srv1"}
+    assert set(nr.inventory.hosts.keys()) == {"r1", "r2", "srv1", "noip"}
 
 
 def test_build_nornir_applies_node_filter_regex():

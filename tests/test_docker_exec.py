@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import subprocess
 
 import pytest
 
@@ -128,7 +129,9 @@ def test_collect_config_task_linux_kind_skips_when_vtysh_unavailable(monkeypatch
     """vtysh を持たないプレーンな linux コンテナは取得対象外としてスキップすること。"""
 
     def fake_run_docker_exec(container, command, timeout):
-        raise RuntimeError("docker exec 失敗 (rc=127): vtysh: not found")
+        raise server._DockerExecError(
+            subprocess.CompletedProcess([], 127, stdout="", stderr="vtysh: not found")
+        )
 
     monkeypatch.setattr(server, "_run_docker_exec", fake_run_docker_exec)
 
@@ -139,6 +142,27 @@ def test_collect_config_task_linux_kind_skips_when_vtysh_unavailable(monkeypatch
 
     assert result.result == ""
     assert result.failed is False
+
+
+@pytest.mark.parametrize("returncode", [1, 124, 255])
+def test_collect_config_task_does_not_hide_execution_errors(monkeypatch, returncode):
+    def fake_run(argv, timeout, label):
+        return subprocess.CompletedProcess(argv, returncode, stdout="", stderr="failure")
+
+    monkeypatch.setattr(server, "_run_argv", fake_run)
+    host = SimpleNamespace(data={"kind": "linux", "container": "clab-x-r1"}, name="r1")
+    with pytest.raises(server._DockerExecError):
+        server._collect_config_task(SimpleNamespace(host=host))
+
+
+def test_collect_config_task_does_not_hide_missing_docker(monkeypatch):
+    def fake_run(container, command, timeout):
+        raise RuntimeError("実行バイナリが見つかりません: docker")
+
+    monkeypatch.setattr(server, "_run_docker_exec", fake_run)
+    host = SimpleNamespace(data={"kind": "linux", "container": "clab-x-r1"}, name="r1")
+    with pytest.raises(RuntimeError, match="docker"):
+        server._collect_config_task(SimpleNamespace(host=host))
 
 
 def test_collect_config_task_skips_unsupported_kind_without_opening_connection():

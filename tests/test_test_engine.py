@@ -1,3 +1,5 @@
+import subprocess
+
 import pytest
 
 import server
@@ -92,3 +94,79 @@ tests:
     assert len(cases) == 1
     assert cases[0]["name"] == "BGP established on r1"
     assert cases[0]["assert"] == {"contains": "Established"}
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        ("exit 7", 7),
+        ("false # trailing comment", 1),
+        ("printf 'no newline'", 0),
+        ("printf '__RC__=0\\n'; exit 7", 7),
+        ("printf 'quote: \" and dollar: $'", 0),
+    ],
+)
+def test_exit_code_uses_shell_status_even_with_exit_comments_or_markers(
+    monkeypatch, command, expected
+):
+    monkeypatch.setattr(server, "_inspect_nodes", lambda lab: [
+        {"name": "r1", "container": "clab-x-r1", "kind": "linux"}
+    ])
+
+    def fake_docker_exec(container, wrapped_command, timeout):
+        proc = subprocess.run(
+            ["sh", "-c", wrapped_command], capture_output=True, text=True, check=True
+        )
+        return proc.stdout
+
+    monkeypatch.setattr(server, "_run_docker_exec", fake_docker_exec)
+    outcomes = server._run_test_case("x", {
+        "command": command, "assert": {"exit_code": expected}
+    })
+    assert len(outcomes) == 1
+    assert outcomes[0]["passed"] is True
+    assert f"actual={expected}" in outcomes[0]["detail"]
+
+
+def test_exit_code_rejects_nos_even_if_command_could_print_marker(monkeypatch):
+    monkeypatch.setattr(server, "_inspect_nodes", lambda lab: [
+        {"name": "r1", "kind": "arista_ceos", "mgmt_ip": "192.0.2.1"}
+    ])
+
+    def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("unsupported exit_code must be rejected before executing a command")
+
+    monkeypatch.setattr(server, "_dispatch_command", unexpected_dispatch)
+    outcomes = server._run_test_case("x", {"command": "show version", "assert": {"exit_code": 0}})
+    assert outcomes[0]["passed"] is False
+    assert "linux kind" in outcomes[0]["detail"]
+
+
+@pytest.mark.parametrize("bad_yaml", [
+    "lab: [", "scalar", "lab: x\ntests: [null]", "lab: x\ntests: text",
+    "tests: []", "lab: 42\ntests: []",
+])
+def test_invalid_test_file_prevents_all_pass_verdict(tmp_path, monkeypatch, bad_yaml):
+    valid = tmp_path / "valid"
+    valid.mkdir()
+    (valid / "test.yml").write_text("lab: x\ntests: [{command: uptime}]", encoding="utf-8")
+    (tmp_path / "test.yml").write_text(bad_yaml, encoding="utf-8")
+    monkeypatch.setattr(server, "_run_test_case", lambda lab, case: [
+        {"test": "valid", "node": "r1", "passed": True, "detail": "OK"}
+    ])
+    report = server.run_topology_tests(str(tmp_path))
+    assert "FAILURES" in report
+    assert "PASS: 1  FAIL: 1" in report
+    assert "ALL PASS" not in report
+
+
+@pytest.mark.parametrize("case", [
+    {"command": 42}, {"command": "uptime", "assert": "bad"},
+    {"command": "uptime", "nodes": ["r1"]},
+])
+def test_invalid_case_fields_fail_before_inspection(monkeypatch, case):
+    def unexpected_inspect(lab):
+        pytest.fail("invalid test case must not contact a lab")
+
+    monkeypatch.setattr(server, "_inspect_nodes", unexpected_inspect)
+    assert server._run_test_case("x", case)[0]["passed"] is False
